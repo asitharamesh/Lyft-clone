@@ -1,0 +1,17 @@
+{
+  "name": "lyft-clone-load-test",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Concurrency load test for the ride-matching pipeline (REST signup + Socket.IO dispatch).",
+  "main": "load_test.js",
+  "scripts": {
+    "start": "node load_test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "axios": "^1.13.2",
+    "socket.io-client": "^4.8.1"
+  }
+}
