@@ -1,0 +1,16 @@
+{
+  "name": "lyft-clone-ride-simulation-engine",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Internal service that animates accepted rides along real roads (via OSRM) and reports progress back to the Flask/Socket.IO backend.",
+  "main": "ride_simulation_engine.js",
+  "scripts": {
+    "start": "node ride_simulation_engine.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "socket.io-client": "^4.8.1"
+  }
+}
