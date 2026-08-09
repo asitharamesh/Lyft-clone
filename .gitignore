@@ -1,0 +1,27 @@
+# Env / secrets
+.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+venv/
+.venv/
+
+# Node
+node_modules/
+package-lock.json
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Redis dump
+dump.rdb
+
+# Logs
+*.log
