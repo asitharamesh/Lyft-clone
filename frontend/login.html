@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Lyft - Login</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body { 
+            margin: 0; font-family: 'Segoe UI', sans-serif; 
+            background-color: #330011;
+            background-image: radial-gradient(circle at 50% 50%, #800020 0%, #1a0005 100%);
+            height: 100vh; display: flex; justify-content: center; align-items: center; 
+            color: white; overflow: hidden;
+        }
+        .bg-logo {
+            position: absolute; top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 400px; font-weight: 900;
+            color: rgba(255, 255, 255, 0.03);
+            z-index: -1; user-select: none;
+            letter-spacing: -20px; font-style: italic;
+        }
+        .container { 
+            background: rgba(255, 255, 255, 0.1); 
+            padding: 40px; width: 340px; border-radius: 24px; 
+            backdrop-filter: blur(20px); 
+            border: 1px solid rgba(255,255,255,0.15);
+            text-align: center; 
+            box-shadow: 0 20px 50px rgba(0,0,0,0.5);
+        }
+        h1 { margin: 0 0 10px 0; font-size: 40px; font-weight: 800; letter-spacing: -1px; }
+        p.subtitle { color: #ffccd5; margin-bottom: 30px; font-size: 14px; font-weight: 500; }
+        .tabs { display: flex; background: rgba(0,0,0,0.4); border-radius: 50px; padding: 4px; margin-bottom: 25px; }
+        .tab { flex: 1; padding: 10px; cursor: pointer; border-radius: 50px; font-size: 14px; font-weight: 600; color: #aaa; transition: 0.3s; }
+        .tab.active { background: white; color: #800020; box-shadow: 0 4px 15px rgba(0,0,0,0.3); }
+        input { width: 100%; padding: 16px; margin-bottom: 15px; background: rgba(255,255,255,0.9); border: none; color: #333; border-radius: 14px; box-sizing: border-box; font-size: 16px; outline: none; }
+        button { width: 100%; padding: 16px; background: linear-gradient(45deg, #ff00bf, #800020); color: white; font-weight: bold; border: none; border-radius: 14px; cursor: pointer; font-size: 16px; margin-top: 10px; box-shadow: 0 5px 15px rgba(255, 0, 191, 0.3); }
+        .link { font-size: 13px; color: #ffccd5; margin-top: 25px; cursor: pointer; opacity: 0.8; }
+        #msg { color: #ff6b6b; font-size: 13px; margin-top: 15px; min-height: 18px; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <div class="bg-logo">lyft</div>
+    <div class="container">
+        <h1>lyft</h1>
+        <p class="subtitle">A better way to get there.</p>
+        <div class="tabs">
+            <div class="tab active" onclick="setMode('rider')" id="tab-rider">Rider</div>
+            <div class="tab" onclick="setMode('driver')" id="tab-driver">Driver</div>
+        </div>
+        
+        <div id="auth-form">
+            <div id="signup-fields" style="display:none;">
+                <input type="text" id="new-name" placeholder="Full Name">
+            </div>
+            <input type="email" id="email" placeholder="Email">
+            <input type="password" id="password" placeholder="Password">
+            <button onclick="handleSubmit()" id="submit-btn">Log in</button>
+        </div>
+        
+        <p id="msg"></p>
+        <p class="link" onclick="toggleMode()" id="toggle-text">New here? Create Account</p>
+    </div>
+
+    <script>
+        let mode = 'rider', isLogin = true;
+        
+        function setMode(m) {
+            mode = m;
+            document.getElementById('tab-rider').className = m === 'rider' ? 'tab active' : 'tab';
+            document.getElementById('tab-driver').className = m === 'driver' ? 'tab active' : 'tab';
+        }
+
+        function toggleMode() {
+            isLogin = !isLogin;
+            document.getElementById('signup-fields').style.display = isLogin ? 'none' : 'block';
+            document.getElementById('submit-btn').innerText = isLogin ? 'Log in' : 'Sign up';
+            document.getElementById('toggle-text').innerText = isLogin ? 'New here? Create Account' : 'Back to Login';
+            document.getElementById('msg').innerText = "";
+        }
+
+        async function handleSubmit() {
+            const btn = document.getElementById('submit-btn');
+            const msg = document.getElementById('msg');
+            btn.innerText = "Connecting...";
+            msg.innerText = "";
+
+            const url = isLogin ? 'http://127.0.0.1:5001/api/login' : 'http://127.0.0.1:5001/api/signup';
+            const payload = { type: mode, email: document.getElementById('email').value, password: document.getElementById('password').value };
+            if (!isLogin) payload.name = document.getElementById('new-name').value;
+
+            try {
+                const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+                const data = await res.json();
+                if (data.success) {
+                    sessionStorage.setItem('user', JSON.stringify(data.user));
+                    sessionStorage.setItem('user_token', data.token);
+                    sessionStorage.setItem('driver', JSON.stringify(data.user));
+                    sessionStorage.setItem('driver_token', data.token);
+                    sessionStorage.setItem('user_type', mode);
+                    window.location.href = mode === 'rider' ? 'new_map.html' : 'driver.html';
+                } else {
+                    msg.innerText = "❌ " + data.message;
+                    btn.innerText = isLogin ? 'Log in' : 'Sign up';
+                }
+            } catch (e) {
+                msg.innerText = "Error: Is 'python app.py' running?";
+                btn.innerText = isLogin ? 'Log in' : 'Sign up';
+            }
+        }
+    </script>
+</body>
+</html>

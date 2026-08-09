@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Lyft Driver Portal</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- Fast CDN preconnections -->
+    <link rel="preconnect" href="https://cdnjs.cloudflare.com" crossorigin>
+    <link rel="preconnect" href="https://basemaps.cartocdn.com" crossorigin>
+    <link rel="dns-prefetch" href="https://cdnjs.cloudflare.com">
+    <link rel="dns-prefetch" href="https://basemaps.cartocdn.com">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css" />
+    <style>
+        body { margin: 0; font-family: 'Segoe UI', sans-serif; background: #f4f6f8; }
+        #map { height: 100vh; width: 100%; cursor: default; background: #e5e3df; }
+        .driver-panel { position: absolute; top: 20px; left: 20px; z-index: 1000; background: white; padding: 25px; width: 340px; border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,0.2); max-height: 90vh; overflow-y: auto; }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+        h2 { color: #800020; font-weight: 800; margin: 0; }
+        .earnings-card { background: #eef6ff; padding: 12px; border-radius: 10px; margin-top: 10px; font-weight: bold; color: #0d6efd; display: flex; justify-content: space-between; align-items: center; font-size: 15px; border: 1px solid #cce5ff; }
+        .earnings-flash { font-size: 12px; color: #28a745; margin-top: 4px; min-height: 16px; }
+        .toggle-container { display: flex; align-items: center; justify-content: space-between; margin-top: 12px; background: #f8f9fa; padding: 12px; border-radius: 8px; border: 1px solid #eee; }
+        .switch { position: relative; display: inline-block; width: 50px; height: 26px; }
+        .switch input { opacity: 0; width: 0; height: 0; }
+        .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; transition: .4s; border-radius: 34px; }
+        .slider:before { position: absolute; content: ""; height: 18px; width: 18px; left: 4px; bottom: 4px; background-color: white; transition: .4s; border-radius: 50%; }
+        input:checked + .slider { background-color: #28a745; }
+        input:checked + .slider:before { transform: translateX(24px); }
+        .status-badge { display: inline-block; padding: 5px 12px; border-radius: 20px; font-size: 13px; font-weight: bold; }
+        .status-offline { background: #e9ecef; color: #495057; }
+        .status-online { background: #d4edda; color: #155724; }
+        .status-box { text-align: center; margin-top: 15px; font-weight: 600; color: #800020; min-height: 20px; font-size: 14px; }
+        .main-btn { width: 100%; padding: 12px; background: #800020; color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 15px; font-weight: bold; margin-top: 10px; }
+        .accept-btn { background: #28a745 !important; }
+        .reject-btn { background: #dc3545 !important; }
+        .pay-btn { background: #198754 !important; font-size: 16px; padding: 14px; margin-top: 12px; }
+        .loc-btn { background: #0d6efd; margin-top: 10px; font-size: 13px; padding: 8px; }
+        .offer-card { background: #fff8fa; border: 1px solid #ffccd5; padding: 12px; border-radius: 10px; margin-top: 12px; text-align: left; font-size: 13px; color: #333; }
+        .offer-card h4 { margin: 0 0 8px 0; color: #800020; font-size: 15px; }
+        .offer-row { margin-bottom: 5px; }
+        .food-badge { background: #fff3cd; color: #856404; padding: 4px 8px; border-radius: 6px; font-weight: bold; margin-bottom: 6px; display: inline-block; }
+        .marker-icon { font-size: 24px; text-align: center; line-height: 24px; }
+    </style>
+</head>
+<body>
+    <div class="driver-panel">
+        <div class="header">
+            <h2>Driver Portal</h2>
+            <span onclick="logout()" style="color:red; cursor:pointer; font-weight:600;">Logout</span>
+        </div>
+        <p id="driver-name" style="color: #666; font-size: 14px; margin-top: -10px;">Logged in as Driver</p>
+        
+        <div class="earnings-card">
+            <span>Total Earnings</span>
+            <span id="driver-earnings">₹0</span>
+        </div>
+        <div id="earnings-flash" class="earnings-flash"></div>
+
+        <div class="toggle-container">
+            <span style="font-weight:600;">Online Status</span>
+            <label class="switch">
+                <input type="checkbox" id="online-toggle" onchange="toggleOnline()">
+                <span class="slider"></span>
+            </label>
+        </div>
+
+        <div style="margin-top: 12px; display: flex; justify-content: space-between; align-items: center;">
+            <span style="font-size: 14px; color: #555;">Current Status:</span>
+            <span id="status-badge" class="status-badge status-offline">Offline</span>
+        </div>
+
+        <button id="set-loc-btn" class="main-btn loc-btn" onclick="enableSetLocation()">📍 Set / Move My Location on Map</button>
+
+        <div id="offer-details" class="offer-card" style="display:none;"></div>
+
+        <div id="offer-actions" style="display:none; margin-top:10px;">
+            <button id="accept-btn" class="main-btn accept-btn" onclick="acceptRide()">Accept Ride</button>
+            <button id="reject-btn" class="main-btn reject-btn" onclick="rejectRide()">Reject Ride</button>
+        </div>
+
+        <button id="collect-pay-btn" class="main-btn pay-btn" style="display:none;" onclick="confirmPaymentReceived()">💵 Confirm Payment Received</button>
+        <button id="action-btn" class="main-btn" style="display:none;"></button>
+
+        <div class="status-box" id="status-text">Set location & toggle online to receive rides</div>
+    </div>
+
+    <div id="map"></div>
+
+    <!-- Fast CDNs for Leaflet and Socket.IO -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
+
+    <script>
+        const userStr = sessionStorage.getItem('driver') || sessionStorage.getItem('user');
+        const userToken = sessionStorage.getItem('driver_token') || sessionStorage.getItem('user_token');
+        if (!userStr || !userToken) window.location.href = 'login.html';
+        const currentUser = JSON.parse(userStr);
+        document.getElementById('driver-name').innerText = `Driver: ${currentUser.name}`;
+        
+        let totalEarnings = currentUser.earnings || 0;
+        document.getElementById('driver-earnings').innerText = `₹${Math.round(totalEarnings)}`;
+
+        function logout() { 
+            sessionStorage.removeItem('user'); 
+            sessionStorage.removeItem('user_token'); 
+            sessionStorage.removeItem('driver'); 
+            sessionStorage.removeItem('driver_token'); 
+            sessionStorage.removeItem('user_type'); 
+            window.location.href = 'login.html'; 
+        }
+
+        let driverLat = 12.9716, driverLng = 77.5946;
+        let settingLocation = false;
+
+        // Fast Leaflet setup with Canvas acceleration
+        const map = L.map('map', { preferCanvas: true, fadeAnimation: false, zoomControl: true }).setView([driverLat, driverLng], 13);
+
+        L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
+            maxZoom: 19,
+            subdomains: 'abcd',
+            updateWhenIdle: false,
+            updateWhenZooming: false,
+            keepBuffer: 4
+        }).addTo(map);
+
+        const forceResize = () => map.invalidateSize();
+        requestAnimationFrame(forceResize);
+        window.addEventListener('load', forceResize);
+
+        const backendBaseUrl = (window.__BACKEND_URL__ || 'http://127.0.0.1:5001').replace(/\/$/, '');
+        const socket = io(backendBaseUrl, { transports: ['websocket'], auth: { token: userToken } });
+
+        const driverIcon = L.divIcon({ html: '🚖', className: 'marker-icon', iconSize: [30, 30] });
+        const greenIcon = L.divIcon({ html: '🟢', className: 'marker-icon', iconSize: [24, 24] });
+        const redIcon = L.divIcon({ html: '🔴', className: 'marker-icon', iconSize: [24, 24] });
+
+        let myMarker = L.marker([driverLat, driverLng], { icon: driverIcon }).addTo(map);
+        let currentRide = null;
+        let routeLine = null;
+        let pickupMarker = null;
+        let dropMarker = null;
+
+        function enableSetLocation() {
+            settingLocation = true;
+            document.getElementById('map').style.cursor = 'crosshair';
+            document.getElementById('status-text').innerText = 'Click anywhere on the map to set your position 📍';
+        }
+
+        map.on('click', function(e) {
+            if (!settingLocation) return;
+            const { lat, lng } = e.latlng;
+            driverLat = lat;
+            driverLng = lng;
+            myMarker.setLatLng([driverLat, driverLng]);
+            map.panTo([driverLat, driverLng]);
+            settingLocation = false;
+            document.getElementById('map').style.cursor = 'default';
+            document.getElementById('status-text').innerText = `Location set to ${lat.toFixed(4)}, ${lng.toFixed(4)}`;
+
+            if (document.getElementById('online-toggle').checked) {
+                socket.emit('driver_online', { driver_id: currentUser.id, lat: driverLat, lng: driverLng });
+            }
+        });
+
+        function toggleOnline() {
+            const isOnline = document.getElementById('online-toggle').checked;
+            const badge = document.getElementById('status-badge');
+            const statusTxt = document.getElementById('status-text');
+
+            if (isOnline) {
+                badge.className = 'status-badge status-online';
+                badge.innerText = 'Online';
+                statusTxt.innerText = 'Waiting for ride requests...';
+                socket.emit('driver_online', { driver_id: currentUser.id, lat: driverLat, lng: driverLng });
+            } else {
+                badge.className = 'status-badge status-offline';
+                badge.innerText = 'Offline';
+                statusTxt.innerText = 'Toggle online to receive rides';
+                document.getElementById('offer-details').style.display = 'none';
+                document.getElementById('offer-actions').style.display = 'none';
+                document.getElementById('collect-pay-btn').style.display = 'none';
+                document.getElementById('action-btn').style.display = 'none';
+                socket.emit('driver_offline', { driver_id: currentUser.id });
+                resetTripUI();
+            }
+        }
+
+        function formatFoodOrder(order) {
+            if (!order) return '';
+            if (Array.isArray(order)) {
+                return order.map(i => `${i.item} (₹${Math.round(i.price)})`).join(', ');
+            }
+            return String(order);
+        }
+
+        function handleRideOffer(data) {
+            currentRide = data;
+            const riderName = data.user_name || 'Rider';
+            const fareAmt = Math.round(data.fare || 0);
+            const pickupName = data.pickup_name || (data.pickup ? `${data.pickup.lat.toFixed(4)}, ${data.pickup.lng.toFixed(4)}` : 'Nearby');
+            const dropName = data.drop_name || (data.drop ? `${data.drop.lat.toFixed(4)}, ${data.drop.lng.toFixed(4)}` : 'Destination');
+
+            let html = `<h4>🚕 New Ride Request</h4>`;
+            html += `<div class="offer-row"><b>Rider:</b> ${riderName}</div>`;
+            html += `<div class="offer-row"><b>Pickup:</b> ${pickupName}</div>`;
+            html += `<div class="offer-row"><b>Dropoff:</b> ${dropName}</div>`;
+
+            const breakdown = data.fare_breakdown || {};
+            if (data.food_order || data.restaurant) {
+                html += `<div class="food-badge">🍔 Food Delivery Order</div>`;
+                if (data.restaurant) html += `<div class="offer-row"><b>Restaurant:</b> ${data.restaurant.name || 'Restaurant'}</div>`;
+                if (data.food_order) {
+                    html += `<div class="offer-row"><b>Order:</b> ${formatFoodOrder(data.food_order)}</div>`;
+                    html += `<div class="offer-row"><b>Food Cost:</b> ₹${Math.round(data.food_order_price || 0)}</div>`;
+                }
+            }
+
+            html += `<div class="offer-row"><b>Base Fare:</b> ₹${Math.round(breakdown.base_fare || 0)}</div>`;
+            html += `<div class="offer-row"><b>Ride Cost:</b> ₹${Math.round(breakdown.ride_km_cost || 0)}</div>`;
+            html += `<div class="offer-row"><b>Ride Fare:</b> ₹${Math.round(breakdown.ride_fare || 0)}</div>`;
+            if (breakdown.food_distance_km) {
+                html += `<div class="offer-row"><b>Food Pickup:</b> ₹${Math.round(breakdown.food_delivery_fee || 0)} (${breakdown.food_distance_km} km + surcharge)</div>`;
+            }
+            html += `<div class="offer-row" style="font-size:16px; font-weight:bold; color:#800020; margin-top:6px;">Total Fare: ₹${fareAmt}</div>`;
+
+            const card = document.getElementById('offer-details');
+            card.innerHTML = html;
+            card.style.display = 'block';
+
+            document.getElementById('status-text').innerText = `🚕 New Offer! Total Fare: ₹${fareAmt}`;
+            document.getElementById('offer-actions').style.display = 'block';
+
+            const pLat = data.pickup_lat || (data.pickup && data.pickup.lat);
+            const pLng = data.pickup_lng || (data.pickup && data.pickup.lng);
+            if (pLat && pLng) {
+                if (pickupMarker) map.removeLayer(pickupMarker);
+                pickupMarker = L.marker([pLat, pLng], { icon: greenIcon }).addTo(map);
+                map.panTo([pLat, pLng]);
+            }
+        }
+
+        socket.on('driver_request', handleRideOffer);
+        socket.on('ride_offer', handleRideOffer);
+
+        function acceptRide() {
+            if (!currentRide) return;
+            document.getElementById('offer-actions').style.display = 'none';
+            const reqId = currentRide.request_id || currentRide.ride_id;
+            socket.emit('driver_response', { request_id: reqId, accepted: true, driver_id: currentUser.id });
+            socket.emit('accept_ride', { ride_id: reqId, driver_id: currentUser.id });
+
+            document.getElementById('status-text').innerText = "Heading to Pickup Location 📍";
+            drawRoute();
+        }
+
+        function rejectRide() {
+            if (!currentRide) return;
+            const reqId = currentRide.request_id || currentRide.ride_id;
+            socket.emit('driver_response', { request_id: reqId, accepted: false, driver_id: currentUser.id });
+            
+            document.getElementById('offer-details').style.display = 'none';
+            document.getElementById('offer-actions').style.display = 'none';
+            document.getElementById('status-text').innerText = "Ride Rejected ❌ Waiting for next request...";
+            resetTripUI();
+        }
+
+        async function drawRoute() {
+            if (!currentRide) return;
+            const pLat = currentRide.pickup_lat || (currentRide.pickup && currentRide.pickup.lat);
+            const pLng = currentRide.pickup_lng || (currentRide.pickup && currentRide.pickup.lng);
+            const dLat = currentRide.drop_lat || (currentRide.drop && currentRide.drop.lat);
+            const dLng = currentRide.drop_lng || (currentRide.drop && currentRide.drop.lng);
+
+            if (pLat && pLng && dLat && dLng) {
+                try {
+                    const url = `https://router.project-osrm.org/route/v1/driving/${pLng},${pLat};${dLng},${dLat}?overview=full&geometries=geojson`;
+                    const res = await fetch(url);
+                    const data = await res.json();
+                    if (data.routes && data.routes[0]) {
+                        const coords = data.routes[0].geometry.coordinates.map(c => [c[1], c[0]]);
+                        if (routeLine) map.removeLayer(routeLine);
+                        routeLine = L.polyline(coords, { color: '#800020', weight: 5, opacity: 0.8 }).addTo(map);
+                        map.fitBounds(routeLine.getBounds(), { padding: [50, 50] });
+                    }
+                } catch (e) {
+                    console.log("Route fetch fallback", e);
+                }
+            }
+        }
+
+        socket.on('driver_moved', (data) => {
+            if (data.driver_id == currentUser.id) {
+                driverLat = data.latitude;
+                driverLng = data.longitude;
+                myMarker.setLatLng([driverLat, driverLng]);
+            }
+        });
+
+        socket.on('ride_progress', (data) => {
+            const s = data.status, txt = document.getElementById('status-text');
+            if (s === 'heading_to_pickup') txt.innerText = currentRide && currentRide.restaurant ? "Heading to Restaurant 🍔" : "Heading to Pickup Location 📍";
+            if (s === 'at_restaurant') txt.innerText = "At Restaurant — picking up food 🍔";
+            if (s === 'food_picked') txt.innerText = "Food picked up! Heading to rider pickup 📍";
+            if (s === 'picked_up') txt.innerText = "Arrived at Pickup / Rider Picked Up! 📍";
+            if (s === 'trip_started') txt.innerText = "Trip Started 🚕 Driving to Dropoff";
+            if (s === 'completed') {
+                const fareVal = Math.round(data.fare || (currentRide ? currentRide.fare : 100));
+                txt.innerText = `📍 Arrived at Destination! Please collect payment ₹${fareVal}.`;
+                
+                const payBtn = document.getElementById('collect-pay-btn');
+                payBtn.innerText = `💵 Confirm Payment Received (₹${fareVal})`;
+                payBtn.style.display = 'block';
+                payBtn.onclick = () => confirmPaymentReceived(fareVal);
+            }
+        });
+
+        function confirmPaymentReceived(fareVal) {
+            const reqId = currentRide ? (currentRide.request_id || currentRide.ride_id) : null;
+            const amt = fareVal || (currentRide ? currentRide.fare : 100);
+            
+            socket.emit('payment_collected', { driver_id: currentUser.id, request_id: reqId, amount: amt });
+            document.getElementById('collect-pay-btn').style.display = 'none';
+            document.getElementById('offer-details').style.display = 'none';
+            document.getElementById('status-text').innerText = "Payment Collected! 🎉 Waiting for new rides...";
+            resetTripUI();
+        }
+
+        socket.on('earnings_update', (data) => {
+            totalEarnings = data.total;
+            document.getElementById('driver-earnings').innerText = `₹${Math.round(totalEarnings)}`;
+            if (data.earned) {
+                const flash = document.getElementById('earnings-flash');
+                flash.innerText = `+₹${Math.round(data.earned)} earned from last ride`;
+                setTimeout(() => { flash.innerText = ''; }, 5000);
+            }
+        });
+
+        function resetTripUI() {
+            currentRide = null;
+            if (pickupMarker) map.removeLayer(pickupMarker);
+            if (dropMarker) map.removeLayer(dropMarker);
+            if (routeLine) map.removeLayer(routeLine);
+        }
+    </script>
+</body>
+</html>
