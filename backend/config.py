@@ -29,6 +29,13 @@ class Config:
     REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     REDIS_DRIVER_GEO_KEY = "drivers:geo"
     DRIVER_LOCATION_TTL_SECONDS = int(os.getenv("DRIVER_LOCATION_TTL_SECONDS", "120"))
+    # How often an online browser driver refreshes its heartbeat. Must stay
+    # well below DRIVER_LOCATION_TTL_SECONDS; sent to the driver page by the
+    # server so it only needs to be configured here.
+    DRIVER_HEARTBEAT_INTERVAL_SECONDS = int(os.getenv("DRIVER_HEARTBEAT_INTERVAL_SECONDS", "30"))
+    # Live positions live in Redis; Postgres keeps a copy written at most this
+    # often per driver instead of on every location ping.
+    LOCATION_PERSIST_INTERVAL_SECONDS = int(os.getenv("LOCATION_PERSIST_INTERVAL_SECONDS", "15"))
 
     # --- Auth / JWT ---
     JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")
@@ -49,8 +56,25 @@ class Config:
 
     # --- Rate limiting ---
     RATELIMIT_STORAGE_URI = os.getenv("RATELIMIT_STORAGE_URI", REDIS_URL)
-    LOGIN_RATE_LIMIT = os.getenv("LOGIN_RATE_LIMIT", "10 per minute")
-    SIGNUP_RATE_LIMIT = os.getenv("SIGNUP_RATE_LIMIT", "5 per minute")
+    # LOAD_TEST_MODE is only for controlled load tests (scripts/load_test.js
+    # creates dozens of accounts from one IP). It replaces the login/signup
+    # limits with LOAD_TEST_RATE_LIMIT, and app.py refuses to start with it
+    # when FLASK_ENV=production. Normal limits are untouched otherwise.
+    LOAD_TEST_MODE = _env_bool("LOAD_TEST_MODE", False)
+    LOAD_TEST_RATE_LIMIT = os.getenv("LOAD_TEST_RATE_LIMIT", "10000 per minute")
+    LOGIN_RATE_LIMIT = LOAD_TEST_RATE_LIMIT if LOAD_TEST_MODE else os.getenv("LOGIN_RATE_LIMIT", "10 per minute")
+    SIGNUP_RATE_LIMIT = LOAD_TEST_RATE_LIMIT if LOAD_TEST_MODE else os.getenv("SIGNUP_RATE_LIMIT", "5 per minute")
+
+    # --- Dispatch ---
+    # How long a driver has to answer a ride offer before it expires and the
+    # ride is offered to the next driver.
+    OFFER_TIMEOUT_SECONDS = int(os.getenv("OFFER_TIMEOUT_SECONDS", "20"))
+    # Which simulator animates accepted rides - exactly one runs:
+    #   "python" (default) - in-process simulator in sockets/handlers.py
+    #   "node"             - backend/ride_simulation_engine.js (the backend
+    #                        refuses the engine's connection in any other mode)
+    #   "none"             - no simulator; driver clients send ride_status_update
+    RIDE_SIMULATOR = os.getenv("RIDE_SIMULATOR", "python").strip().lower()
 
     # --- Matching / routing ---
     DRIVER_SEARCH_RADIUS_KM = float(os.getenv("DRIVER_SEARCH_RADIUS_KM", "8"))

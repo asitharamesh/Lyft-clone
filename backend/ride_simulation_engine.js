@@ -26,8 +26,10 @@ const socket = io(SERVER_URL, {
     auth: { service_token: SERVICE_TOKEN },
 });
 
+// The backend only accepts this engine when it runs with RIDE_SIMULATOR=node,
+// so it can never animate rides alongside the in-process Python simulator.
 socket.on('connect_error', (err) => {
-    console.error('Simulation engine failed to authenticate with backend:', err.message);
+    console.error('Simulation engine connection refused by backend:', err.message);
 });
 
 console.log('Ride simulation engine connected, waiting for accepted rides...');
@@ -63,6 +65,7 @@ socket.on('start_simulation_ride', async (data) => {
     }
 
     driver.requestId = data.request_id;
+    driver.hasFood = false; // per ride - otherwise a later non-food ride reports food_picked
     driver.missionQueue = [];
     if (data.restaurant) {
         driver.missionQueue.push({ type: 'TO_RESTAURANT', target: data.restaurant });
@@ -95,7 +98,9 @@ async function startNextLeg(driver) {
     driver.state = leg.type;
 
     let statusMsg = '';
-    if (leg.type === 'TO_RESTAURANT') statusMsg = 'to_restaurant';
+    // Same step names as the in-process simulator; the backend only accepts
+    // forward progress through these (see services/ride_service.py).
+    if (leg.type === 'TO_RESTAURANT') statusMsg = 'heading_to_pickup';
     if (leg.type === 'TO_PICKUP') statusMsg = driver.hasFood ? 'food_picked' : 'heading_to_pickup';
     if (leg.type === 'TO_DROP') statusMsg = 'trip_started';
 

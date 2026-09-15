@@ -6,9 +6,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <!-- Fast CDN preconnections -->
     <link rel="preconnect" href="https://cdnjs.cloudflare.com" crossorigin>
-    <link rel="preconnect" href="https://basemaps.cartocdn.com" crossorigin>
+    <link rel="preconnect" href="https://tile.openstreetmap.org" crossorigin>
     <link rel="dns-prefetch" href="https://cdnjs.cloudflare.com">
-    <link rel="dns-prefetch" href="https://basemaps.cartocdn.com">
+    <link rel="dns-prefetch" href="https://tile.openstreetmap.org">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css" />
     <style>
         body { margin: 0; font-family: 'Segoe UI', sans-serif; }
@@ -28,6 +28,7 @@
         .fare-detail-row { display: flex; justify-content: space-between; font-size: 13px; color: #555; margin-bottom: 5px; }
         .fare-total-row { display: flex; justify-content: space-between; font-size: 18px; font-weight: bold; color: #800020; margin-top: 10px; border-top: 1px solid #ddd; padding-top: 10px; }
         .fare-detail-row.order-price { font-weight: bold; color: #155724; font-size: 14px; margin-top: 8px; }
+        .fare-detail-row.prominent { font-weight: bold; color: #800020; font-size: 14px; }
         .marker-icon { font-size: 24px; text-align: center; line-height: 24px; }
         .food-ride-panel { display: none; background: #fff8e6; border: 1px solid #ffe08a; padding: 12px; border-radius: 8px; margin-bottom: 12px; font-size: 13px; }
         .food-ride-panel h4 { margin: 0 0 8px 0; color: #856404; font-size: 14px; }
@@ -114,10 +115,11 @@
         // Fast local map setup with Canvas acceleration
         const map = L.map('map', { preferCanvas: true, fadeAnimation: false, zoomControl: true }).setView([12.9716, 77.5946], 13);
         
-        // Fast CartoDB Tiles with caching & pre-fetching
-        L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
+        // Standard OpenStreetMap tiles: free, no API key, no watermark.
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
             maxZoom: 19,
-            subdomains: 'abcd',
+            subdomains: 'abc',
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
             updateWhenIdle: false,
             updateWhenZooming: false,
             keepBuffer: 4
@@ -142,39 +144,69 @@
         let rideActive = false;
         let awaitingPayment = false;
         let confirmedFare = 0;
+        let pickupPlaceName = null, dropPlaceName = null;
 
-        function enablePickMode(mode) { 
-            pickMode = mode; 
-            document.getElementById('map').style.cursor = 'crosshair'; 
-            document.getElementById('status-text').innerText = `Click on the Map to set ${mode.toUpperCase()}!`; 
-            
+        function enablePickMode(mode) {
+            pickMode = mode;
+            document.getElementById('map').style.cursor = 'crosshair';
+            document.getElementById('status-text').innerText = `Click on the Map to set ${mode.toUpperCase()}!`;
+
             document.getElementById('btn-pickup').classList.toggle('active', mode === 'pickup');
             document.getElementById('btn-drop').classList.toggle('active', mode === 'drop');
+        }
+
+        // Best-effort reverse geocoding via the public OSM Nominatim API so the
+        // pickup/drop fields can show a place name instead of raw coordinates.
+        // Falls back silently (caller keeps the coordinate text) on any failure.
+        async function reverseGeocode(lat, lng) {
+            try {
+                const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lng}&zoom=16&addressdetails=0`);
+                const data = await res.json();
+                if (!data || !data.display_name) return null;
+                return data.display_name.split(',').slice(0, 3).join(',').trim();
+            } catch (e) {
+                console.log('Reverse geocode error', e);
+                return null;
+            }
         }
 
         map.on('click', function(e) {
             if (!pickMode) return;
             const { lat, lng } = e.latlng;
-            
-            if (pickMode === 'pickup') { 
-                pickupCoords = [lat, lng]; 
-                if(pickupMarker) map.removeLayer(pickupMarker); 
-                pickupMarker = L.marker([lat, lng], { icon: greenIcon }).addTo(map); 
+
+            if (pickMode === 'pickup') {
+                pickupCoords = [lat, lng];
+                pickupPlaceName = null;
+                if(pickupMarker) map.removeLayer(pickupMarker);
+                pickupMarker = L.marker([lat, lng], { icon: greenIcon }).addTo(map);
                 document.getElementById('pickup-text').value = `Pickup: ${lat.toFixed(4)}, ${lng.toFixed(4)}`;
+                reverseGeocode(lat, lng).then(name => {
+                    if (name && pickupCoords && pickupCoords[0] === lat && pickupCoords[1] === lng) {
+                        pickupPlaceName = name;
+                        document.getElementById('pickup-text').value = `Pickup: ${name}`;
+                    }
+                });
             }
-            else if (pickMode === 'drop') { 
-                dropCoords = [lat, lng]; 
-                if(dropMarker) map.removeLayer(dropMarker); 
-                dropMarker = L.marker([lat, lng], { icon: redIcon }).addTo(map); 
+            else if (pickMode === 'drop') {
+                dropCoords = [lat, lng];
+                dropPlaceName = null;
+                if(dropMarker) map.removeLayer(dropMarker);
+                dropMarker = L.marker([lat, lng], { icon: redIcon }).addTo(map);
                 document.getElementById('drop-text').value = `Drop: ${lat.toFixed(4)}, ${lng.toFixed(4)}`;
+                reverseGeocode(lat, lng).then(name => {
+                    if (name && dropCoords && dropCoords[0] === lat && dropCoords[1] === lng) {
+                        dropPlaceName = name;
+                        document.getElementById('drop-text').value = `Drop: ${name}`;
+                    }
+                });
                 calculateFare();
                 drawRoutePolyline();
             }
 
             document.getElementById('btn-pickup').classList.remove('active');
             document.getElementById('btn-drop').classList.remove('active');
-            pickMode = null; 
-            document.getElementById('map').style.cursor = 'default'; 
+            pickMode = null;
+            document.getElementById('map').style.cursor = 'default';
         });
 
         async function drawRoutePolyline() {
@@ -212,16 +244,41 @@
             const orderText = formatFoodOrder(data.food_order || foodOrder);
             const orderPrice = data.food_order_price || foodOrderPrice || 0;
             const fare = Math.round(data.fare || confirmedFare || 0);
-            panel.innerHTML = `
-                <h4>🍔 Food Delivery Ride</h4>
-                <div class="food-ride-row"><b>From (Restaurant):</b> ${restName}</div>
-                <div class="food-ride-row"><b>To (Drop):</b> ${data.drop_name || document.getElementById('drop-text').value}</div>
-                <div class="food-ride-row"><b>Pickup:</b> ${data.pickup_name || document.getElementById('pickup-text').value}</div>
-                <div class="food-ride-row"><b>Order:</b> ${orderText}</div>
-                <div class="food-ride-row"><b>Food Cost:</b> ₹${Math.round(orderPrice)}</div>
-                <div class="food-ride-row" style="font-weight:bold;color:#800020;margin-top:6px;"><b>Total Fare:</b> ₹${fare}</div>
-            `;
+            const heading = document.createElement('h4');
+            heading.textContent = '🍔 Food Delivery Ride';
+            panel.replaceChildren(
+                heading,
+                labelledRow('food-ride-row', 'From (Restaurant)', restName),
+                labelledRow('food-ride-row', 'To (Drop)', data.drop_name || document.getElementById('drop-text').value),
+                labelledRow('food-ride-row', 'Pickup', data.pickup_name || document.getElementById('pickup-text').value),
+                labelledRow('food-ride-row', 'Order', orderText),
+                labelledRow('food-ride-row', 'Food Cost', `₹${Math.round(orderPrice)}`),
+            );
+            const totalRow = labelledRow('food-ride-row', 'Total Fare', `₹${fare}`);
+            totalRow.style.cssText = 'font-weight:bold;color:#800020;margin-top:6px;';
+            panel.appendChild(totalRow);
             panel.style.display = 'block';
+        }
+
+        // Server/rider-provided values are only inserted as text, never as HTML.
+        function labelledRow(className, label, value) {
+            const row = document.createElement('div');
+            row.className = className;
+            const b = document.createElement('b');
+            b.textContent = `${label}:`;
+            row.append(b, ` ${value}`);
+            return row;
+        }
+
+        function fareRow(label, value, extraClass) {
+            const row = document.createElement('div');
+            row.className = extraClass ? `fare-detail-row ${extraClass}` : 'fare-detail-row';
+            const left = document.createElement('span');
+            left.textContent = label;
+            const right = document.createElement('span');
+            right.textContent = value;
+            row.append(left, right);
+            return row;
         }
 
         function setRideActive(active) {
@@ -307,17 +364,19 @@
                 const data = await response.json();
                 if (!data.success) return;
 
-                let html = `<div class="fare-detail-row"><span>Base Fare</span><span>₹${data.base_fare}</span></div>`;
-                html += `<div class="fare-detail-row"><span>Ride Cost (${data.distance_km} km)</span><span>₹${data.ride_km_cost}</span></div>`;
-                html += `<div class="fare-detail-row"><span>Ride Fare</span><span>₹${data.ride_fare}</span></div>`;
+                const fareRows = [
+                    fareRow('Base Fare', `₹${data.base_fare}`),
+                    fareRow(`Ride Cost (${data.distance_km} km)`, `₹${data.ride_km_cost}`),
+                    fareRow('Ride Fare', `₹${data.ride_fare}`),
+                ];
 
                 if (data.is_food_ride) {
-                    html += `<div class="fare-detail-row order-price"><span>Food Order</span><span>₹${Math.round(data.food_order_price)}</span></div>`;
-                    html += `<div class="fare-detail-row"><span>Food Pickup (${data.food_distance_km} km + surcharge)</span><span>₹${data.food_delivery_fee}</span></div>`;
+                    fareRows.push(fareRow('Food Order', `₹${Math.round(data.food_order_price)}`, 'order-price'));
+                    fareRows.push(fareRow(`Food Pickup (${data.food_distance_km} km + surcharge)`, `₹${data.food_delivery_fee}`, 'prominent'));
                 }
 
                 document.getElementById('fare-box').style.display = 'block'; 
-                document.getElementById('fare-details').innerHTML = html;
+                document.getElementById('fare-details').replaceChildren(...fareRows);
                 document.getElementById('price-val').innerText = `₹${Math.round(data.total)}`;
             } catch (e) {
                 console.log('Fare estimate error', e);
@@ -338,8 +397,8 @@
                 pickup_lat: pickupCoords[0], pickup_lng: pickupCoords[1], 
                 drop_lat: dropCoords[0], drop_lng: dropCoords[1], 
                 payment_method: document.getElementById('payment-method').value,
-                pickup_name: `${pickupCoords[0].toFixed(4)}, ${pickupCoords[1].toFixed(4)}`,
-                drop_name: `${dropCoords[0].toFixed(4)}, ${dropCoords[1].toFixed(4)}`,
+                pickup_name: pickupPlaceName || `${pickupCoords[0].toFixed(4)}, ${pickupCoords[1].toFixed(4)}`,
+                drop_name: dropPlaceName || `${dropCoords[0].toFixed(4)}, ${dropCoords[1].toFixed(4)}`,
                 food_order: foodOrder, food_order_price: foodOrderPrice 
             };
 
@@ -376,7 +435,9 @@
             }
         });
         
-        socket.on('ride_progress', (data) => {
+        socket.on('ride_progress', applyRideProgress);
+
+        function applyRideProgress(data) {
             const s = data.status, txt = document.getElementById('status-text');
             if(s==='heading_to_pickup') txt.innerText="🚕 Driver is heading to your pickup location...";
             if(s==='at_restaurant') txt.innerText="🍔 Driver arrived at the restaurant!";
@@ -392,7 +453,7 @@
                 if (data.driver_id && markers[data.driver_id]) map.removeLayer(markers[data.driver_id]);
                 if (data.driver_id) delete markers[data.driver_id];
             }
-        });
+        }
         
         socket.on('payment_confirmed', (data) => {
             awaitingPayment = false;
@@ -400,6 +461,46 @@
             const fare = Math.round((data && data.fare) || confirmedFare || 0);
             document.getElementById('thanks-payment-msg').innerText = `Payment of ₹${fare} confirmed. Book another ride?`;
             document.getElementById('thanks-modal').style.display='flex';
+        });
+
+        // Sent by the server on (re)connect when this rider has an open ride,
+        // so a reload or dropped connection doesn't lose the trip.
+        socket.on('ride_state', (ride) => {
+            pickupCoords = [ride.pickup.lat, ride.pickup.lng];
+            dropCoords = [ride.drop.lat, ride.drop.lng];
+            if (pickupMarker) map.removeLayer(pickupMarker);
+            if (dropMarker) map.removeLayer(dropMarker);
+            pickupMarker = L.marker(pickupCoords, { icon: greenIcon }).addTo(map);
+            dropMarker = L.marker(dropCoords, { icon: redIcon }).addTo(map);
+            drawRoutePolyline();
+
+            confirmedFare = Math.round(ride.fare || 0);
+            document.getElementById('fare-box').style.display = 'block';
+            document.getElementById('price-val').innerText = `₹${confirmedFare}`;
+
+            if (ride.status === 'requested') {
+                setRideActive(true);
+                document.getElementById('status-text').innerText = "🔍 Finding Driver...";
+                return;
+            }
+            showFoodRidePanel(ride);
+            if (ride.status === 'completed') {
+                awaitingPayment = true;
+                setRideActive(true);
+                myDriverId = null;
+                document.getElementById('status-text').innerText = `🎉 Arrived at destination! Waiting for driver to confirm payment of ₹${confirmedFare}...`;
+                return;
+            }
+            setRideActive(true);
+            if (ride.driver) {
+                myDriverId = ride.driver.id;
+                if (!markers[myDriverId]) markers[myDriverId] = L.marker([ride.driver.lat, ride.driver.lng], {icon:carIcon}).addTo(map);
+            }
+            if (ride.progress === 'accepted') {
+                document.getElementById('status-text').innerText = `✅ Driver ${ride.driver ? ride.driver.name : ''} accepted! Total: ₹${confirmedFare}`;
+            } else {
+                applyRideProgress({ status: ride.progress, fare: ride.fare });
+            }
         });
 
         function resetApp() {
@@ -412,6 +513,7 @@
             if(restMarker) map.removeLayer(restMarker);
             if(routeLine) map.removeLayer(routeLine);
             pickupCoords=null; dropCoords=null; restaurantCoords=null; restaurantName=null;
+            pickupPlaceName=null; dropPlaceName=null;
             foodOrder=null; foodOrderPrice=0; confirmedFare=0;
             awaitingPayment=false;
             setRideActive(false);

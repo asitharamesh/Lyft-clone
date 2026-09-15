@@ -13,6 +13,7 @@
 --     secondary option to the Redis GEO index used in matching_service.py.
 
 DROP TABLE IF EXISTS order_items;
+DROP TABLE IF EXISTS ride_offers;   -- created by migrations/001_ride_lifecycle.sql
 DROP TABLE IF EXISTS rides;
 DROP TABLE IF EXISTS food_orders;
 DROP TABLE IF EXISTS menu_items;

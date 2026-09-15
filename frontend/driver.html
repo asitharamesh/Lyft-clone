@@ -6,9 +6,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <!-- Fast CDN preconnections -->
     <link rel="preconnect" href="https://cdnjs.cloudflare.com" crossorigin>
-    <link rel="preconnect" href="https://basemaps.cartocdn.com" crossorigin>
+    <link rel="preconnect" href="https://tile.openstreetmap.org" crossorigin>
     <link rel="dns-prefetch" href="https://cdnjs.cloudflare.com">
-    <link rel="dns-prefetch" href="https://basemaps.cartocdn.com">
+    <link rel="dns-prefetch" href="https://tile.openstreetmap.org">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css" />
     <style>
         body { margin: 0; font-family: 'Segoe UI', sans-serif; background: #f4f6f8; }
@@ -30,9 +30,11 @@
         .status-online { background: #d4edda; color: #155724; }
         .status-box { text-align: center; margin-top: 15px; font-weight: 600; color: #800020; min-height: 20px; font-size: 14px; }
         .main-btn { width: 100%; padding: 12px; background: #800020; color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 15px; font-weight: bold; margin-top: 10px; }
+        .main-btn:disabled { background: #aaa !important; cursor: not-allowed; }
         .accept-btn { background: #28a745 !important; }
         .reject-btn { background: #dc3545 !important; }
         .pay-btn { background: #198754 !important; font-size: 16px; padding: 14px; margin-top: 12px; }
+        .pay-note { font-size: 11px; color: #666; margin-top: 4px; text-align: center; }
         .loc-btn { background: #0d6efd; margin-top: 10px; font-size: 13px; padding: 8px; }
         .offer-card { background: #fff8fa; border: 1px solid #ffccd5; padding: 12px; border-radius: 10px; margin-top: 12px; text-align: left; font-size: 13px; color: #333; }
         .offer-card h4 { margin: 0 0 8px 0; color: #800020; font-size: 15px; }
@@ -48,7 +50,7 @@
             <span onclick="logout()" style="color:red; cursor:pointer; font-weight:600;">Logout</span>
         </div>
         <p id="driver-name" style="color: #666; font-size: 14px; margin-top: -10px;">Logged in as Driver</p>
-        
+
         <div class="earnings-card">
             <span>Total Earnings</span>
             <span id="driver-earnings">₹0</span>
@@ -78,6 +80,7 @@
         </div>
 
         <button id="collect-pay-btn" class="main-btn pay-btn" style="display:none;" onclick="confirmPaymentReceived()">💵 Confirm Payment Received</button>
+        <div id="pay-note" class="pay-note" style="display:none;">Confirms you collected the fare yourself. No payment is processed in the app.</div>
         <button id="action-btn" class="main-btn" style="display:none;"></button>
 
         <div class="status-box" id="status-text">Set location & toggle online to receive rides</div>
@@ -95,17 +98,20 @@
         if (!userStr || !userToken) window.location.href = 'login.html';
         const currentUser = JSON.parse(userStr);
         document.getElementById('driver-name').innerText = `Driver: ${currentUser.name}`;
-        
+
         let totalEarnings = currentUser.earnings || 0;
         document.getElementById('driver-earnings').innerText = `₹${Math.round(totalEarnings)}`;
 
-        function logout() { 
-            sessionStorage.removeItem('user'); 
-            sessionStorage.removeItem('user_token'); 
-            sessionStorage.removeItem('driver'); 
-            sessionStorage.removeItem('driver_token'); 
-            sessionStorage.removeItem('user_type'); 
-            window.location.href = 'login.html'; 
+        function logout() {
+            stopHeartbeat();
+            if (socket.connected) socket.emit('driver_offline', { driver_id: currentUser.id });
+            socket.disconnect();
+            sessionStorage.removeItem('user');
+            sessionStorage.removeItem('user_token');
+            sessionStorage.removeItem('driver');
+            sessionStorage.removeItem('driver_token');
+            sessionStorage.removeItem('user_type');
+            window.location.href = 'login.html';
         }
 
         let driverLat = 12.9716, driverLng = 77.5946;
@@ -114,9 +120,11 @@
         // Fast Leaflet setup with Canvas acceleration
         const map = L.map('map', { preferCanvas: true, fadeAnimation: false, zoomControl: true }).setView([driverLat, driverLng], 13);
 
-        L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
+        // Standard OpenStreetMap tiles: free, no API key, no watermark.
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
             maxZoom: 19,
-            subdomains: 'abcd',
+            subdomains: 'abc',
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
             updateWhenIdle: false,
             updateWhenZooming: false,
             keepBuffer: 4
@@ -132,12 +140,77 @@
         const driverIcon = L.divIcon({ html: '🚖', className: 'marker-icon', iconSize: [30, 30] });
         const greenIcon = L.divIcon({ html: '🟢', className: 'marker-icon', iconSize: [24, 24] });
         const redIcon = L.divIcon({ html: '🔴', className: 'marker-icon', iconSize: [24, 24] });
+        const restIcon = L.divIcon({ html: '🍔', className: 'marker-icon', iconSize: [24, 24] });
 
         let myMarker = L.marker([driverLat, driverLng], { icon: driverIcon }).addTo(map);
         let currentRide = null;
+        let rideConfirmed = false;   // true only once the server has assigned currentRide to this driver
         let routeLine = null;
         let pickupMarker = null;
         let dropMarker = null;
+        let restMarker = null;
+
+        // --- Heartbeat -------------------------------------------------------
+        // While online, the page refreshes its place in the matching pool so the
+        // server doesn't treat it as stale. The interval comes from the server
+        // (DRIVER_HEARTBEAT_INTERVAL_SECONDS). Only one timer ever exists.
+        let heartbeatSeconds = 30;
+        let heartbeatTimer = null;
+
+        function startHeartbeat() {
+            stopHeartbeat();
+            heartbeatTimer = setInterval(() => {
+                if (socket.connected && isOnlineToggled()) {
+                    socket.emit('driver_heartbeat', { lat: driverLat, lng: driverLng });
+                }
+            }, heartbeatSeconds * 1000);
+        }
+
+        function stopHeartbeat() {
+            if (heartbeatTimer) {
+                clearInterval(heartbeatTimer);
+                heartbeatTimer = null;
+            }
+        }
+
+        function isOnlineToggled() {
+            return document.getElementById('online-toggle').checked;
+        }
+
+        function setOnlineBadge(online) {
+            const badge = document.getElementById('status-badge');
+            badge.className = online ? 'status-badge status-online' : 'status-badge status-offline';
+            badge.innerText = online ? 'Online' : 'Offline';
+        }
+
+        function goOnline() {
+            socket.emit('driver_online', { driver_id: currentUser.id, lat: driverLat, lng: driverLng });
+        }
+
+        socket.on('connect', () => {
+            // Reconnected while toggled online: rejoin the pool (the server refuses
+            // this while a ride is active, and restores the ride via ride_state).
+            if (isOnlineToggled() && !currentRide) goOnline();
+        });
+
+        socket.on('disconnect', stopHeartbeat);
+
+        socket.on('driver_status', (data) => {
+            if (data.heartbeat_interval_seconds) heartbeatSeconds = data.heartbeat_interval_seconds;
+            if (data.online) {
+                document.getElementById('online-toggle').checked = true;
+                setOnlineBadge(true);
+                if (!heartbeatTimer) startHeartbeat();
+                return;
+            }
+            stopHeartbeat();
+            if (data.reason === 'not_in_pool' && isOnlineToggled() && !currentRide) {
+                // e.g. the backend restarted or this tab was suspended past the TTL.
+                goOnline();
+            } else if (data.reason === 'invalid_location') {
+                document.getElementById('status-text').innerText = 'Set a valid location on the map to go online.';
+            }
+        });
 
         function enableSetLocation() {
             settingLocation = true;
@@ -156,31 +229,32 @@
             document.getElementById('map').style.cursor = 'default';
             document.getElementById('status-text').innerText = `Location set to ${lat.toFixed(4)}, ${lng.toFixed(4)}`;
 
-            if (document.getElementById('online-toggle').checked) {
-                socket.emit('driver_online', { driver_id: currentUser.id, lat: driverLat, lng: driverLng });
+            if (isOnlineToggled() && !currentRide) {
+                goOnline();
             }
         });
 
         function toggleOnline() {
-            const isOnline = document.getElementById('online-toggle').checked;
-            const badge = document.getElementById('status-badge');
+            const isOnline = isOnlineToggled();
             const statusTxt = document.getElementById('status-text');
 
             if (isOnline) {
-                badge.className = 'status-badge status-online';
-                badge.innerText = 'Online';
+                setOnlineBadge(true);
                 statusTxt.innerText = 'Waiting for ride requests...';
-                socket.emit('driver_online', { driver_id: currentUser.id, lat: driverLat, lng: driverLng });
+                goOnline();
             } else {
-                badge.className = 'status-badge status-offline';
-                badge.innerText = 'Offline';
+                stopHeartbeat();
+                setOnlineBadge(false);
                 statusTxt.innerText = 'Toggle online to receive rides';
-                document.getElementById('offer-details').style.display = 'none';
-                document.getElementById('offer-actions').style.display = 'none';
-                document.getElementById('collect-pay-btn').style.display = 'none';
-                document.getElementById('action-btn').style.display = 'none';
                 socket.emit('driver_offline', { driver_id: currentUser.id });
-                resetTripUI();
+                if (!rideConfirmed) {
+                    document.getElementById('offer-details').style.display = 'none';
+                    document.getElementById('offer-actions').style.display = 'none';
+                    document.getElementById('collect-pay-btn').style.display = 'none';
+                    document.getElementById('pay-note').style.display = 'none';
+                    document.getElementById('action-btn').style.display = 'none';
+                    resetTripUI();
+                }
             }
         }
 
@@ -192,50 +266,92 @@
             return String(order);
         }
 
-        function handleRideOffer(data) {
-            currentRide = data;
+        // Rider-controlled values (names, places, food items) are only ever
+        // inserted as text nodes, never parsed as HTML.
+        function addRow(parent, label, value, style) {
+            const row = document.createElement('div');
+            row.className = 'offer-row';
+            if (style) row.style.cssText = style;
+            const b = document.createElement('b');
+            b.textContent = `${label}:`;
+            row.append(b, ` ${value}`);
+            parent.appendChild(row);
+        }
+
+        function renderRideCard(data, title) {
             const riderName = data.user_name || 'Rider';
             const fareAmt = Math.round(data.fare || 0);
             const pickupName = data.pickup_name || (data.pickup ? `${data.pickup.lat.toFixed(4)}, ${data.pickup.lng.toFixed(4)}` : 'Nearby');
             const dropName = data.drop_name || (data.drop ? `${data.drop.lat.toFixed(4)}, ${data.drop.lng.toFixed(4)}` : 'Destination');
 
-            let html = `<h4>🚕 New Ride Request</h4>`;
-            html += `<div class="offer-row"><b>Rider:</b> ${riderName}</div>`;
-            html += `<div class="offer-row"><b>Pickup:</b> ${pickupName}</div>`;
-            html += `<div class="offer-row"><b>Dropoff:</b> ${dropName}</div>`;
+            const card = document.getElementById('offer-details');
+            const heading = document.createElement('h4');
+            heading.textContent = title;
+            card.replaceChildren(heading);
+            addRow(card, 'Rider', riderName);
+            addRow(card, 'Pickup', pickupName);
+            addRow(card, 'Dropoff', dropName);
 
             const breakdown = data.fare_breakdown || {};
             if (data.food_order || data.restaurant) {
-                html += `<div class="food-badge">🍔 Food Delivery Order</div>`;
-                if (data.restaurant) html += `<div class="offer-row"><b>Restaurant:</b> ${data.restaurant.name || 'Restaurant'}</div>`;
+                const badge = document.createElement('div');
+                badge.className = 'food-badge';
+                badge.textContent = '🍔 Food Delivery Order';
+                card.appendChild(badge);
+                if (data.restaurant) addRow(card, 'Restaurant', data.restaurant.name || 'Restaurant');
                 if (data.food_order) {
-                    html += `<div class="offer-row"><b>Order:</b> ${formatFoodOrder(data.food_order)}</div>`;
-                    html += `<div class="offer-row"><b>Food Cost:</b> ₹${Math.round(data.food_order_price || 0)}</div>`;
+                    addRow(card, 'Order', formatFoodOrder(data.food_order));
+                    addRow(card, 'Food Cost', `₹${Math.round(data.food_order_price || 0)}`, 'font-weight:bold; color:#800020;');
                 }
             }
 
-            html += `<div class="offer-row"><b>Base Fare:</b> ₹${Math.round(breakdown.base_fare || 0)}</div>`;
-            html += `<div class="offer-row"><b>Ride Cost:</b> ₹${Math.round(breakdown.ride_km_cost || 0)}</div>`;
-            html += `<div class="offer-row"><b>Ride Fare:</b> ₹${Math.round(breakdown.ride_fare || 0)}</div>`;
-            if (breakdown.food_distance_km) {
-                html += `<div class="offer-row"><b>Food Pickup:</b> ₹${Math.round(breakdown.food_delivery_fee || 0)} (${breakdown.food_distance_km} km + surcharge)</div>`;
+            if (data.fare_breakdown) {
+                addRow(card, 'Base Fare', `₹${Math.round(breakdown.base_fare || 0)}`);
+                addRow(card, 'Ride Cost', `₹${Math.round(breakdown.ride_km_cost || 0)}`);
+                addRow(card, 'Ride Fare', `₹${Math.round(breakdown.ride_fare || 0)}`);
+                if (breakdown.food_distance_km) {
+                    addRow(card, 'Food Pickup', `₹${Math.round(breakdown.food_delivery_fee || 0)} (${breakdown.food_distance_km} km + surcharge)`, 'font-weight:bold; color:#800020;');
+                }
             }
-            html += `<div class="offer-row" style="font-size:16px; font-weight:bold; color:#800020; margin-top:6px;">Total Fare: ₹${fareAmt}</div>`;
-
-            const card = document.getElementById('offer-details');
-            card.innerHTML = html;
+            addRow(card, 'Total Fare', `₹${fareAmt}`, 'font-size:16px; font-weight:bold; color:#800020; margin-top:6px;');
+            if (data.offer_expires_in_seconds) {
+                addRow(card, 'Respond within', `${data.offer_expires_in_seconds}s`);
+            }
             card.style.display = 'block';
-
-            document.getElementById('status-text').innerText = `🚕 New Offer! Total Fare: ₹${fareAmt}`;
-            document.getElementById('offer-actions').style.display = 'block';
 
             const pLat = data.pickup_lat || (data.pickup && data.pickup.lat);
             const pLng = data.pickup_lng || (data.pickup && data.pickup.lng);
             if (pLat && pLng) {
                 if (pickupMarker) map.removeLayer(pickupMarker);
                 pickupMarker = L.marker([pLat, pLng], { icon: greenIcon }).addTo(map);
+            }
+
+            const dLat = data.drop_lat || (data.drop && data.drop.lat);
+            const dLng = data.drop_lng || (data.drop && data.drop.lng);
+            if (dLat && dLng) {
+                if (dropMarker) map.removeLayer(dropMarker);
+                dropMarker = L.marker([dLat, dLng], { icon: redIcon }).addTo(map);
+            }
+
+            if (data.restaurant && data.restaurant.lat != null && data.restaurant.lng != null) {
+                if (restMarker) map.removeLayer(restMarker);
+                restMarker = L.marker([data.restaurant.lat, data.restaurant.lng], { icon: restIcon }).addTo(map);
+            }
+
+            if (data.restaurant && data.restaurant.lat != null && data.restaurant.lng != null) {
+                map.panTo([data.restaurant.lat, data.restaurant.lng]);
+            } else if (pLat && pLng) {
                 map.panTo([pLat, pLng]);
             }
+            return fareAmt;
+        }
+
+        function handleRideOffer(data) {
+            if (rideConfirmed) return;   // already on a ride
+            currentRide = data;
+            const fareAmt = renderRideCard(data, '🚕 New Ride Request');
+            document.getElementById('status-text').innerText = `🚕 New Offer! Total Fare: ₹${fareAmt}`;
+            document.getElementById('offer-actions').style.display = 'block';
         }
 
         socket.on('driver_request', handleRideOffer);
@@ -248,42 +364,83 @@
             socket.emit('driver_response', { request_id: reqId, accepted: true, driver_id: currentUser.id });
             socket.emit('accept_ride', { ride_id: reqId, driver_id: currentUser.id });
 
-            document.getElementById('status-text').innerText = "Heading to Pickup Location 📍";
-            drawRoute();
+            // Not accepted until the server confirms with ride_assigned: another
+            // driver may have won the ride, or the offer may have expired.
+            document.getElementById('status-text').innerText = "Confirming ride with server...";
         }
+
+        socket.on('ride_assigned', (data) => {
+            if (!data.success || !currentRide || data.request_id !== currentRide.request_id) return;
+            if (!data.driver || data.driver.id != currentUser.id) return;
+            rideConfirmed = true;
+            document.getElementById('status-text').innerText = currentRide.restaurant ? "Heading to Restaurant 🍔" : "Heading to Pickup Location 📍";
+            drawRoute('heading_to_pickup');
+        });
+
+        socket.on('ride_accept_failed', (data) => {
+            if (rideConfirmed || !currentRide || data.request_id !== currentRide.request_id) return;
+            document.getElementById('offer-details').style.display = 'none';
+            document.getElementById('offer-actions').style.display = 'none';
+            document.getElementById('status-text').innerText = `❌ ${data.message || 'This ride is no longer available.'} Waiting for next request...`;
+            resetTripUI();
+        });
+
+        socket.on('offer_expired', (data) => {
+            if (rideConfirmed || !currentRide || data.request_id !== currentRide.request_id) return;
+            document.getElementById('offer-details').style.display = 'none';
+            document.getElementById('offer-actions').style.display = 'none';
+            document.getElementById('status-text').innerText = "⌛ Offer expired. Waiting for next request...";
+            resetTripUI();
+        });
 
         function rejectRide() {
             if (!currentRide) return;
             const reqId = currentRide.request_id || currentRide.ride_id;
             socket.emit('driver_response', { request_id: reqId, accepted: false, driver_id: currentUser.id });
-            
+
             document.getElementById('offer-details').style.display = 'none';
             document.getElementById('offer-actions').style.display = 'none';
             document.getElementById('status-text').innerText = "Ride Rejected ❌ Waiting for next request...";
             resetTripUI();
         }
 
-        async function drawRoute() {
+        async function drawRouteLeg(fromLat, fromLng, toLat, toLng) {
+            if (fromLat == null || fromLng == null || toLat == null || toLng == null) return;
+            try {
+                const url = `https://router.project-osrm.org/route/v1/driving/${fromLng},${fromLat};${toLng},${toLat}?overview=full&geometries=geojson`;
+                const res = await fetch(url);
+                const data = await res.json();
+                if (data.routes && data.routes[0]) {
+                    const coords = data.routes[0].geometry.coordinates.map(c => [c[1], c[0]]);
+                    if (routeLine) map.removeLayer(routeLine);
+                    routeLine = L.polyline(coords, { color: '#800020', weight: 5, opacity: 0.8 }).addTo(map);
+                    map.fitBounds(routeLine.getBounds(), { padding: [50, 50] });
+                }
+            } catch (e) {
+                console.log("Route fetch fallback", e);
+            }
+        }
+
+        // Draws whichever leg of the trip the driver is currently on, so the
+        // line always leads from where the driver actually is: to the
+        // restaurant first for food orders, then to the rider's pickup, then
+        // (once picked up) on to the drop-off.
+        function drawRoute(status) {
             if (!currentRide) return;
             const pLat = currentRide.pickup_lat || (currentRide.pickup && currentRide.pickup.lat);
             const pLng = currentRide.pickup_lng || (currentRide.pickup && currentRide.pickup.lng);
             const dLat = currentRide.drop_lat || (currentRide.drop && currentRide.drop.lat);
             const dLng = currentRide.drop_lng || (currentRide.drop && currentRide.drop.lng);
+            const rest = currentRide.restaurant;
 
-            if (pLat && pLng && dLat && dLng) {
-                try {
-                    const url = `https://router.project-osrm.org/route/v1/driving/${pLng},${pLat};${dLng},${dLat}?overview=full&geometries=geojson`;
-                    const res = await fetch(url);
-                    const data = await res.json();
-                    if (data.routes && data.routes[0]) {
-                        const coords = data.routes[0].geometry.coordinates.map(c => [c[1], c[0]]);
-                        if (routeLine) map.removeLayer(routeLine);
-                        routeLine = L.polyline(coords, { color: '#800020', weight: 5, opacity: 0.8 }).addTo(map);
-                        map.fitBounds(routeLine.getBounds(), { padding: [50, 50] });
-                    }
-                } catch (e) {
-                    console.log("Route fetch fallback", e);
-                }
+            if (status === 'picked_up' || status === 'trip_started') {
+                drawRouteLeg(pLat, pLng, dLat, dLng);
+            } else if (status === 'food_picked') {
+                drawRouteLeg(driverLat, driverLng, pLat, pLng);
+            } else if (rest && rest.lat != null && rest.lng != null) {
+                drawRouteLeg(driverLat, driverLng, rest.lat, rest.lng);
+            } else {
+                drawRouteLeg(driverLat, driverLng, pLat, pLng);
             }
         }
 
@@ -295,34 +452,61 @@
             }
         });
 
-        socket.on('ride_progress', (data) => {
-            const s = data.status, txt = document.getElementById('status-text');
-            if (s === 'heading_to_pickup') txt.innerText = currentRide && currentRide.restaurant ? "Heading to Restaurant 🍔" : "Heading to Pickup Location 📍";
+        function applyProgress(s, fare) {
+            const txt = document.getElementById('status-text');
+            if (['heading_to_pickup', 'accepted', 'food_picked', 'picked_up', 'trip_started'].includes(s)) drawRoute(s);
+            if (s === 'heading_to_pickup' || s === 'accepted') txt.innerText = currentRide && currentRide.restaurant ? "Heading to Restaurant 🍔" : "Heading to Pickup Location 📍";
             if (s === 'at_restaurant') txt.innerText = "At Restaurant — picking up food 🍔";
             if (s === 'food_picked') txt.innerText = "Food picked up! Heading to rider pickup 📍";
             if (s === 'picked_up') txt.innerText = "Arrived at Pickup / Rider Picked Up! 📍";
             if (s === 'trip_started') txt.innerText = "Trip Started 🚕 Driving to Dropoff";
             if (s === 'completed') {
-                const fareVal = Math.round(data.fare || (currentRide ? currentRide.fare : 100));
+                const fareVal = Math.round(fare || (currentRide ? currentRide.fare : 0));
                 txt.innerText = `📍 Arrived at Destination! Please collect payment ₹${fareVal}.`;
-                
+
                 const payBtn = document.getElementById('collect-pay-btn');
                 payBtn.innerText = `💵 Confirm Payment Received (₹${fareVal})`;
+                payBtn.disabled = false;
                 payBtn.style.display = 'block';
+                document.getElementById('pay-note').style.display = 'block';
                 payBtn.onclick = () => confirmPaymentReceived(fareVal);
             }
+        }
+
+        socket.on('ride_progress', (data) => applyProgress(data.status, data.fare));
+
+        // Sent by the server on (re)connect when this driver has an open ride.
+        socket.on('ride_state', (ride) => {
+            currentRide = ride;
+            rideConfirmed = true;
+            renderRideCard(ride, '🚕 Current Ride');
+            document.getElementById('offer-actions').style.display = 'none';
+            drawRoute(ride.progress);
+            applyProgress(ride.progress, ride.fare);
         });
 
         function confirmPaymentReceived(fareVal) {
             const reqId = currentRide ? (currentRide.request_id || currentRide.ride_id) : null;
-            const amt = fareVal || (currentRide ? currentRide.fare : 100);
-            
+            const amt = fareVal || (currentRide ? currentRide.fare : 0);
+
             socket.emit('payment_collected', { driver_id: currentUser.id, request_id: reqId, amount: amt });
-            document.getElementById('collect-pay-btn').style.display = 'none';
-            document.getElementById('offer-details').style.display = 'none';
-            document.getElementById('status-text').innerText = "Payment Collected! 🎉 Waiting for new rides...";
-            resetTripUI();
+            const payBtn = document.getElementById('collect-pay-btn');
+            payBtn.disabled = true;
+            document.getElementById('status-text').innerText = "Confirming payment...";
         }
+
+        socket.on('payment_failed', (data) => {
+            const payBtn = document.getElementById('collect-pay-btn');
+            document.getElementById('status-text').innerText = `❌ ${data.message || 'Payment confirmation refused.'}`;
+            if (data.reason === 'already_confirmed') {
+                payBtn.style.display = 'none';
+                document.getElementById('pay-note').style.display = 'none';
+                document.getElementById('offer-details').style.display = 'none';
+                resetTripUI();
+            } else {
+                payBtn.disabled = false;
+            }
+        });
 
         socket.on('earnings_update', (data) => {
             totalEarnings = data.total;
@@ -332,12 +516,21 @@
                 flash.innerText = `+₹${Math.round(data.earned)} earned from last ride`;
                 setTimeout(() => { flash.innerText = ''; }, 5000);
             }
+            if (currentRide && data.request_id === currentRide.request_id) {
+                document.getElementById('collect-pay-btn').style.display = 'none';
+                document.getElementById('pay-note').style.display = 'none';
+                document.getElementById('offer-details').style.display = 'none';
+                document.getElementById('status-text').innerText = "Payment Collected! 🎉 Waiting for new rides...";
+                resetTripUI();
+            }
         });
 
         function resetTripUI() {
             currentRide = null;
+            rideConfirmed = false;
             if (pickupMarker) map.removeLayer(pickupMarker);
             if (dropMarker) map.removeLayer(dropMarker);
+            if (restMarker) map.removeLayer(restMarker);
             if (routeLine) map.removeLayer(routeLine);
         }
     </script>

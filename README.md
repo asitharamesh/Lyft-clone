@@ -8,7 +8,8 @@ Redis.
 ## Features
 
 - **Rider app** — request a ride or food delivery on an interactive map,
-  track your assigned driver in real time, pay in-app.
+  track your assigned driver in real time. Payment is simulated: the driver
+  confirms the fare was collected (no payment gateway, no money moves).
 - **Driver app** — go online, receive ride offers, accept/decline, follow
   turn-by-turn trip status, track earnings.
 - **Real-time dispatch** — nearby drivers are found and offered rides over
@@ -64,9 +65,16 @@ Redis.
 4. On acceptance, the ride is persisted to Postgres, and both driver and
    rider sockets join a shared per-ride room for all further updates
    (progress, location, payment) — no data goes to unrelated clients.
-5. The ride-simulation engine drives the accepted ride along the real road
-   route and streams back status/location, which the backend relays into
-   that same room.
+5. A ride simulator (exactly one, chosen by `RIDE_SIMULATOR`) drives the
+   accepted ride along the road route and reports status/location through
+   the same guarded transitions a real driver client uses; the backend
+   relays them into that same room.
+
+Ride state (`requested → accepted → in_progress → completed`, or
+`cancelled`), driver offers (`pending → accepted | rejected | expired`) and
+payment confirmation are persisted in Postgres, so a reconnecting rider or
+driver gets the current ride back. Offers expire after
+`OFFER_TIMEOUT_SECONDS` and the ride moves to the next driver.
 
 ## Tech stack
 
@@ -132,9 +140,10 @@ cp backend/.env.example backend/.env
 docker compose up --build
 ```
 
-Once the backend is healthy, seed some demo data:
+Once the backend is running, create the tables and seed some demo data:
 
 ```bash
+docker compose exec backend python init_db.py
 docker compose exec backend python seed_db.py
 ```
 
@@ -156,21 +165,34 @@ cp .env.example .env          # fill in your DB/Redis/JWT values
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 
-python init_db.py             # create tables
+python init_db.py             # create tables (DROPS existing ones), then apply migrations/
 python seed_db.py             # demo accounts + restaurants (password: password123)
 
 python app.py                  # backend on http://127.0.0.1:5001
 ```
 
-In separate terminals:
+Upgrading an existing database instead? Keep your data and only apply the
+migrations: `python init_db.py --migrate`.
+
+In a separate terminal, serve the frontend:
 
 ```bash
-# static frontend
 python3 -m http.server 8000 --directory frontend
-
-# ride simulation engine (animates accepted rides along real roads)
-cd backend && npm install && node ride_simulation_engine.js
 ```
+
+#### Ride simulator
+
+Accepted rides are animated by exactly one simulator, chosen with
+`RIDE_SIMULATOR` in `backend/.env`:
+
+| Value | Simulator |
+|---|---|
+| `python` (default) | In-process simulator inside the backend. Nothing else to run. |
+| `node` | `backend/ride_simulation_engine.js`. Start it with `cd backend && npm install && node ride_simulation_engine.js`. |
+| `none` | No simulator; driver clients report progress with `ride_status_update`. |
+
+The backend refuses the Node engine's connection unless `RIDE_SIMULATOR=node`,
+so the two simulators never drive the same rides.
 
 Open `http://localhost:8000/login.html`.
 
@@ -180,6 +202,7 @@ Seeded by `seed_db.py`, all with password `password123`:
 
 - Riders: `user0@test.com` … `user4@test.com`
 - Drivers: `driver0@test.com` … `driver2@test.com`
+- Admin: `admin@test.com` (pre-flagged `is_admin`, sign in on `admin.html`)
 
 ### Food delivery mode
 
@@ -191,7 +214,18 @@ House` (seeded in `seed_db.py`).
 
 ```bash
 cd backend
-pytest tests/test_pricing.py tests/test_routing.py tests/test_matching.py -v
+pytest tests -v
+```
+
+Without extra setup this runs the unit tests and skips the integration tests.
+The integration tests exercise the ride lifecycle, offers, payment
+confirmation, the driver pool and Socket.IO flows against a real Postgres and
+Redis. To run them, point them at a disposable database and Redis db, which
+they wipe:
+
+```bash
+createdb lyft_clone_test
+LYFT_TEST_DB_NAME=lyft_clone_test LYFT_TEST_REDIS_URL=redis://localhost:6379/15 pytest tests -v
 ```
 
 For a full live check against a running backend (real Postgres/Redis, real
@@ -200,14 +234,91 @@ JWT-authenticated sockets), see `backend/tests/manual_socket_flow_check.py`.
 ### Load testing
 
 `scripts/load_test.js` brings a fleet of real driver accounts online and
-fires concurrent ride requests through the actual matching pipeline,
-reporting p50/p95 latency for `request_ride → ride_assigned`:
+fires concurrent ride requests through the actual dispatch pipeline. It
+reports each stage separately (ride created, driver offered, driver accepted,
+no driver available, completed, payment confirmed), with latency percentiles
+for the stages that succeeded.
+
+It creates all its accounts from one IP, so start the backend with
+`LOAD_TEST_MODE=true`. That setting raises the login/signup rate limits for
+this purpose only, and the backend refuses to start with it when
+`FLASK_ENV=production`:
 
 ```bash
+# backend
+LOAD_TEST_MODE=true python app.py
+
+# load test
 cd scripts
 npm install
 node load_test.js --drivers=50 --riders=20 --url=http://127.0.0.1:5001
 ```
+
+## Admin dashboard
+
+`frontend/admin.html` shows operational state. It covers backend,
+Postgres and Redis health; connected sockets; driver pool freshness and
+eligibility; rides by status; stuck or inconsistent rides; offers; Redis key
+counts; table sizes; and payment-confirmation totals. It is read-only and
+refreshes every 10 seconds.
+
+`seed_db.py` flags one demo account (`admin@test.com` / `password123`) as
+admin, so a freshly seeded database always has one you can sign in with
+right away.
+
+Admin access is a flag on a rider account, and it can only be granted from
+the command line. Run `set_admin.py` in the same place your database is
+actually running:
+
+```bash
+# Docker Compose
+docker compose exec backend python set_admin.py someone@example.com           # grant
+docker compose exec backend python set_admin.py someone@example.com --revoke  # revoke
+
+# Manual setup (venv, local Postgres)
+cd backend
+python set_admin.py someone@example.com           # grant
+python set_admin.py someone@example.com --revoke  # revoke
+```
+
+Running it the other way round (e.g. from your host venv while Postgres is
+actually inside Docker) silently targets whatever database your local `.env`
+points at, which can be a different, unmigrated database — the account gets
+"granted" there instead of in the one the app is using, or `is_admin` may not
+exist there yet if it predates `migrations/001_ride_lifecycle.sql`.
+
+The admin then opens `http://localhost:8000/admin.html` and signs in with
+that account's password. The page is not the security boundary.
+`GET /api/admin/overview` requires a valid JWT whose role is `admin`, and it
+re-checks `users.is_admin` in Postgres on every request. Missing or invalid
+tokens get 401; rider, driver and revoked-admin tokens get 403. Signup and
+login payloads cannot grant the role. The response contains aggregates and
+ids only: no passwords, hashes, emails, tokens or secrets.
+
+## Recent frontend updates
+
+- **Admin login link** — the login page has an "Admin Login" link in the
+  top-right corner that goes to `admin.html`. The admin sign-in screen itself
+  now uses the same red gradient / glass-card theme as the rider/driver login
+  page, with a link back to it.
+- **Place names on the map** — the rider map reverse-geocodes the pickup and
+  drop points you click (via the public OSM Nominatim API) and shows the
+  resolved place name instead of raw coordinates; it falls back to the
+  coordinates if the lookup fails.
+- **Map tiles** — switched from CartoDB's basemap (which now shows a
+  "for evaluation only" watermark without an API key) to standard
+  OpenStreetMap tiles, which are free, watermark-free and need no key.
+- **Driver map: restaurant + correct route leg** — the driver's map now shows
+  a 🍔 marker for the restaurant on food orders, and the route line always
+  leads from the driver's current position to wherever they're actually
+  headed next (restaurant → rider pickup → drop-off), instead of always
+  showing the pickup→drop leg regardless of where the driver is.
+- **Fare breakdown emphasis** — the total fare, food cost and food delivery
+  fee are bold/prominent in the fare breakdown (rider map and driver ride
+  card); the ride-distance cost stays in the regular detailed breakdown.
+- **Demo admin account** — `seed_db.py` now also seeds `admin@test.com`
+  (password `password123`) with `is_admin` set, so a freshly seeded database
+  always has a working admin login out of the box.
 
 ## Configuration
 
@@ -224,10 +335,13 @@ source.
 | `/api/login` | POST | Authenticate, returns a JWT |
 | `/api/menu` | POST | Look up a restaurant's menu by name |
 | `/api/health` | GET | Postgres/Redis dependency health check |
+| `/api/admin/overview` | GET | Admin-only operational overview (`Authorization: Bearer <admin JWT>`) |
 
-Key Socket.IO events: `driver_online`, `update_location`, `request_ride`,
-`driver_request`, `driver_response`, `ride_assigned`, `ride_status_update`,
-`ride_progress`, `payment_collected`, `earnings_update`. All connections
+Key Socket.IO events: `driver_online`, `driver_heartbeat`, `driver_status`,
+`update_location`, `request_ride`, `ride_requested`, `driver_request`,
+`driver_response`, `ride_accept_failed`, `offer_expired`, `ride_assigned`,
+`ride_state` (sent on reconnect), `ride_status_update`, `ride_progress`,
+`payment_collected`, `payment_failed`, `earnings_update`. All connections
 authenticate via a JWT passed in the `auth` payload at connect time.
 
 ## Possible next steps

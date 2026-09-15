@@ -1,20 +1,30 @@
 /**
- * Load test for the ride-matching pipeline.
+ * Load test for the ride-dispatch pipeline.
  *
- * Spins up N virtual drivers (real accounts + real websocket connections,
- * going "online" at randomized locations around a center point) and then
- * fires M concurrent ride requests from virtual riders, measuring the
- * time from `request_ride` to a driver actually being offered the ride
- * (the Redis-GEO matching path in services/matching_service.py) and the
- * time to full acceptance.
+ * Brings N virtual drivers online (real accounts + real websocket
+ * connections at randomized locations around a center point) and fires M
+ * concurrent ride requests from virtual riders through the exact REST +
+ * Socket.IO code paths a real client uses. Virtual drivers accept every
+ * offer, keep their heartbeat alive, and confirm payment when a ride
+ * completes.
  *
- * This is what backs the latency numbers in the README - it exercises the
- * exact same REST + Socket.IO code paths a real client would, just many of
- * them at once, so the numbers reflect the matching pipeline, not a
- * synthetic microbenchmark.
+ * Every stage is counted separately, so "no driver available" is never
+ * reported as a successful match:
+ *   request acknowledged -> ride created -> driver offered -> driver accepted
+ *   -> ride completed -> payment confirmed
+ *
+ * Rate limits: the script creates drivers + riders accounts from one IP,
+ * which the normal signup limit (5/minute) rejects. Run the backend with
+ * LOAD_TEST_MODE=true for a controlled load test (the backend refuses that
+ * setting when FLASK_ENV=production).
+ *
+ * No results are committed with this script; numbers depend on the machine,
+ * configuration, simulator mode and OSRM availability.
  *
  * Usage:
- *   node load_test.js --drivers=50 --riders=20 --url=http://127.0.0.1:5001
+ *   node load_test.js --drivers=50 --riders=20 --url=http://127.0.0.1:5001 [--timeout=180]
+ *   --timeout: seconds to wait per ride for it to finish (the default
+ *   in-process simulator takes tens of seconds per ride).
  */
 const axios = require('axios');
 const io = require('socket.io-client');
@@ -29,19 +39,37 @@ const args = Object.fromEntries(
 const BASE_URL = args.url || process.env.BACKEND_URL || 'http://127.0.0.1:5001';
 const NUM_DRIVERS = parseInt(args.drivers || '50', 10);
 const NUM_RIDERS = parseInt(args.riders || '20', 10);
+const TIMEOUT_MS = parseInt(args.timeout || '180', 10) * 1000;
 const CENTER = { lat: 12.9716, lng: 77.5946 }; // Bangalore, matches seed data
 const SPREAD = 0.05; // ~5km jitter box
 
 const jitter = () => (Math.random() - 0.5) * SPREAD;
 const runId = Date.now();
+const now = () => Number(process.hrtime.bigint()) / 1e6;
+
+// Driver-side observations, keyed by request id.
+const firstOfferAt = new Map();
+const assignedDrivers = new Map(); // request_id -> Set of driver ids told they won it
+const driverCounters = { offers: 0, acceptRefused: 0, offersExpired: 0, paymentsConfirmed: 0, paymentsRefused: 0 };
 
 async function signup(type, i) {
-    const res = await axios.post(`${BASE_URL}/api/signup`, {
-        type,
-        name: `LoadTest ${type} ${i}`,
-        email: `loadtest_${type}_${runId}_${i}@test.com`,
-        password: 'loadtestpass1',
-    });
+    let res;
+    try {
+        res = await axios.post(`${BASE_URL}/api/signup`, {
+            type,
+            name: `LoadTest ${type} ${i}`,
+            email: `loadtest_${type}_${runId}_${i}@test.com`,
+            password: 'loadtestpass1',
+        });
+    } catch (err) {
+        if (err.response && err.response.status === 429) {
+            throw new Error(
+                'signup was rate limited (HTTP 429). Restart the backend with LOAD_TEST_MODE=true ' +
+                'for a controlled load test (never in production).'
+            );
+        }
+        throw err;
+    }
     if (!res.data.success) throw new Error(`signup failed: ${JSON.stringify(res.data)}`);
     return res.data;
 }
@@ -55,20 +83,51 @@ function connectSocket(token) {
 }
 
 async function setupDriver(i) {
-    const { token } = await signup('driver', i);
+    const { token, user } = await signup('driver', i);
     const socket = await connectSocket(token);
-    socket.emit('driver_online', { lat: CENTER.lat + jitter(), lng: CENTER.lng + jitter() });
+    const position = { lat: CENTER.lat + jitter(), lng: CENTER.lng + jitter() };
+    let heartbeat = null;
+
+    socket.on('driver_status', (status) => {
+        if (status.online && !heartbeat) {
+            const seconds = status.heartbeat_interval_seconds || 30;
+            heartbeat = setInterval(() => socket.emit('driver_heartbeat', position), seconds * 1000);
+        }
+    });
     socket.on('driver_request', (data) => {
+        driverCounters.offers++;
+        if (!firstOfferAt.has(data.request_id)) firstOfferAt.set(data.request_id, now());
         // Auto-accept immediately, like a driver tapping "Accept".
         socket.emit('driver_response', { request_id: data.request_id, accepted: true });
     });
-    return socket;
+    socket.on('ride_assigned', (data) => {
+        if (data.success && data.driver && data.driver.id === user.id) {
+            if (!assignedDrivers.has(data.request_id)) assignedDrivers.set(data.request_id, new Set());
+            assignedDrivers.get(data.request_id).add(user.id);
+        }
+    });
+    socket.on('ride_accept_failed', () => driverCounters.acceptRefused++);
+    socket.on('offer_expired', () => driverCounters.offersExpired++);
+    socket.on('ride_progress', (data) => {
+        if (data.status === 'completed') {
+            socket.emit('payment_collected', { driver_id: user.id, request_id: data.request_id, amount: data.fare });
+        }
+    });
+    socket.on('earnings_update', () => driverCounters.paymentsConfirmed++);
+    socket.on('payment_failed', () => driverCounters.paymentsRefused++);
+
+    socket.emit('driver_online', position);
+    return {
+        stop() {
+            clearInterval(heartbeat);
+            socket.disconnect();
+        },
+    };
 }
 
 async function setupRider(i) {
     const { token } = await signup('rider', i);
-    const socket = await connectSocket(token);
-    return socket;
+    return connectSocket(token);
 }
 
 function percentile(sorted, p) {
@@ -92,17 +151,43 @@ function summarize(label, samples) {
     );
 }
 
-async function runRiderRequest(i) {
-    const socket = await setupRider(i);
+function runRiderRequest(socket) {
     return new Promise((resolve) => {
-        const start = process.hrtime.bigint();
-        let assignedMs = null;
-
-        socket.on('ride_assigned', () => {
-            const end = process.hrtime.bigint();
-            assignedMs = Number(end - start) / 1e6;
+        const r = {
+            startedAt: now(), requestId: null, acknowledged: false, created: false, accepted: false,
+            noDriver: false, completed: false, paid: false, timedOut: false, failure: null, t: {},
+        };
+        let done = false;
+        const finish = () => {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
             socket.disconnect();
-            resolve(assignedMs);
+            resolve(r);
+        };
+        const elapsed = () => now() - r.startedAt;
+
+        socket.on('ride_assigned', (data) => {
+            if (data.success) {
+                r.accepted = true;
+                r.t.accepted = elapsed();
+            } else {
+                // Server-side refusal or no driver available: never counted as a match.
+                if (r.created) r.noDriver = true;
+                r.failure = data.message || 'ride_assigned success=false';
+                finish();
+            }
+        });
+        socket.on('ride_progress', (data) => {
+            if (data.status === 'completed') {
+                r.completed = true;
+                r.t.completed = elapsed();
+            }
+        });
+        socket.on('payment_confirmed', () => {
+            r.paid = true;
+            r.t.paid = elapsed();
+            finish();
         });
 
         socket.emit('request_ride', {
@@ -112,14 +197,22 @@ async function runRiderRequest(i) {
             drop_lng: CENTER.lng + jitter(),
             pickup_name: 'Load Test Pickup',
             drop_name: 'Load Test Drop',
+        }, (ack) => {
+            r.acknowledged = true;
+            r.t.ack = elapsed();
+            if (ack && ack.success && ack.request_id) {
+                r.created = true;
+                r.requestId = ack.request_id;
+            } else {
+                r.failure = (ack && ack.message) || 'request refused';
+                finish();
+            }
         });
 
-        setTimeout(() => {
-            if (assignedMs === null) {
-                socket.disconnect();
-                resolve(null); // timed out / no driver available
-            }
-        }, 8000);
+        const timer = setTimeout(() => {
+            r.timedOut = true;
+            finish();
+        }, TIMEOUT_MS);
     });
 }
 
@@ -127,25 +220,54 @@ async function main() {
     console.log(`Setting up ${NUM_DRIVERS} virtual drivers...`);
     const driverSetupStart = Date.now();
     const drivers = await Promise.all(Array.from({ length: NUM_DRIVERS }, (_, i) => setupDriver(i)));
-    console.log(`  ${drivers.length} drivers online in ${Date.now() - driverSetupStart}ms`);
+    console.log(`  ${drivers.length} drivers connected in ${Date.now() - driverSetupStart}ms`);
+
+    console.log(`Setting up ${NUM_RIDERS} virtual riders...`);
+    const riders = await Promise.all(Array.from({ length: NUM_RIDERS }, (_, i) => setupRider(i)));
 
     await new Promise((r) => setTimeout(r, 500)); // let geo-index writes settle
 
-    console.log(`Firing ${NUM_RIDERS} concurrent ride requests...`);
+    console.log(`Firing ${NUM_RIDERS} concurrent ride requests (waiting up to ${TIMEOUT_MS / 1000}s per ride)...`);
     const overallStart = Date.now();
-    const results = await Promise.all(Array.from({ length: NUM_RIDERS }, (_, i) => runRiderRequest(i)));
+    const results = await Promise.all(riders.map((socket) => runRiderRequest(socket)));
     const overallMs = Date.now() - overallStart;
 
-    const successes = results.filter((r) => r !== null);
-    const failures = results.length - successes.length;
+    const count = (pred) => results.filter(pred).length;
+    const n = results.length;
+    const doubleAssigned = [...assignedDrivers.values()].filter((ids) => ids.size > 1).length;
+    const failures = {};
+    results.filter((r) => r.failure && !r.noDriver).forEach((r) => {
+        failures[r.failure] = (failures[r.failure] || 0) + 1;
+    });
 
     console.log('\n--- Results ---');
-    console.log(`Concurrent ride requests: ${NUM_RIDERS} against ${NUM_DRIVERS} available drivers`);
-    console.log(`Successful matches: ${successes.length}/${results.length} (${failures} timed out/no driver)`);
-    console.log(`Total wall-clock time for all requests: ${overallMs}ms`);
-    summarize('request_ride -> ride_assigned latency', successes);
+    console.log(`Concurrent ride requests: ${n}, virtual drivers: ${NUM_DRIVERS}`);
+    console.log(`Request acknowledged by server:   ${count((r) => r.acknowledged)}/${n}`);
+    console.log(`Ride created (persisted):          ${count((r) => r.created)}/${n}`);
+    console.log(`Driver offered the ride:           ${count((r) => r.requestId && firstOfferAt.has(r.requestId))}/${n}`);
+    console.log(`Driver accepted (ride assigned):   ${count((r) => r.accepted)}/${n}`);
+    console.log(`No driver available:               ${count((r) => r.noDriver)}/${n}`);
+    console.log(`Ride completed:                    ${count((r) => r.completed)}/${n}`);
+    console.log(`Payment confirmed:                 ${count((r) => r.paid)}/${n}`);
+    console.log(`Timed out:                         ${count((r) => r.timedOut)}/${n}`);
+    Object.entries(failures).forEach(([message, c]) => console.log(`Other failure "${message}": ${c}`));
+    console.log(
+        `Driver side: offers=${driverCounters.offers} accepts_refused=${driverCounters.acceptRefused} ` +
+        `offers_expired=${driverCounters.offersExpired} payments_confirmed=${driverCounters.paymentsConfirmed} ` +
+        `payments_refused=${driverCounters.paymentsRefused}`
+    );
+    console.log(`Rides assigned to more than one driver: ${doubleAssigned}`);
+    console.log(`Total wall-clock time: ${overallMs}ms`);
 
-    drivers.forEach((s) => s.disconnect());
+    summarize('request_ride -> ride created (ack)', results.filter((r) => r.created).map((r) => r.t.ack));
+    summarize(
+        'request_ride -> first driver offer',
+        results.filter((r) => r.requestId && firstOfferAt.has(r.requestId)).map((r) => firstOfferAt.get(r.requestId) - r.startedAt)
+    );
+    summarize('request_ride -> driver accepted', results.filter((r) => r.accepted).map((r) => r.t.accepted));
+    summarize('request_ride -> ride completed', results.filter((r) => r.completed).map((r) => r.t.completed));
+
+    drivers.forEach((d) => d.stop());
     process.exit(0);
 }
 

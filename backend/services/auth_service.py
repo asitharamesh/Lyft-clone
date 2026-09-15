@@ -17,21 +17,36 @@ import jwt
 from config import Config
 
 
+def _run_off_hub(fn, *args):
+    """bcrypt is deliberately slow, CPU-bound C code. Under eventlet (one OS
+    thread) calling it inline freezes every socket for the whole hash.
+    eventlet.tpool runs it on a real OS thread - bcrypt releases the GIL
+    while hashing - so other green threads keep running. Outside a
+    monkey-patched process (scripts, tests) it is simply called inline."""
+    try:
+        from eventlet import patcher, tpool
+    except ImportError:
+        return fn(*args)
+    if patcher.is_monkey_patched("socket"):
+        return tpool.execute(fn, *args)
+    return fn(*args)
+
+
 def hash_password(plain_password: str) -> str:
     salt = bcrypt.gensalt(rounds=Config.BCRYPT_ROUNDS)
-    return bcrypt.hashpw(plain_password.encode("utf-8"), salt).decode("utf-8")
+    return _run_off_hub(bcrypt.hashpw, plain_password.encode("utf-8"), salt).decode("utf-8")
 
 
 def verify_password(plain_password: str, hashed: str) -> bool:
     try:
-        return bcrypt.checkpw(plain_password.encode("utf-8"), hashed.encode("utf-8"))
+        return _run_off_hub(bcrypt.checkpw, plain_password.encode("utf-8"), hashed.encode("utf-8"))
     except (ValueError, TypeError):
         # Covers legacy/plaintext rows if migrating an old DB - treat as mismatch.
         return False
 
 
 def issue_token(user_id: int, role: str, name: str) -> str:
-    """role is 'rider' or 'driver'. Returned token is what the client stores
+    """role is 'rider', 'driver' or 'admin'. Returned token is what the client stores
     (e.g. localStorage) and sends back as `Authorization: Bearer <token>` on
     REST calls, and in the `auth` payload on socket.io connect."""
     now = datetime.datetime.utcnow()

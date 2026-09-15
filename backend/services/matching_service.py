@@ -35,53 +35,125 @@ GEO_KEY = Config.REDIS_DRIVER_GEO_KEY
 RATING_WEIGHT_KM = 0.6
 
 
+# Refresh a driver's position and heartbeat only if they are still in the
+# pool. Atomic, so a late heartbeat can never re-add a driver who just went
+# offline or accepted a ride.
+_REFRESH_IF_MEMBER_LUA = """
+if redis.call('ZSCORE', KEYS[1], ARGV[1]) then
+    redis.call('SETEX', KEYS[2], ARGV[4], '1')
+    redis.call('GEOADD', KEYS[1], ARGV[2], ARGV[3], ARGV[1])
+    return 1
+end
+return 0
+"""
+
+# Remove a pool member only if its heartbeat is (still) missing. Atomic, so a
+# driver who refreshes at the same moment is never removed by mistake.
+_REMOVE_IF_STALE_LUA = """
+if redis.call('EXISTS', KEYS[2]) == 0 then
+    return redis.call('ZREM', KEYS[1], ARGV[1])
+end
+return 0
+"""
+
+
+def _heartbeat_key(driver_id) -> str:
+    return f"driver:heartbeat:{driver_id}"
+
+
 def upsert_driver_location(driver_id: int, lat: float, lng: float) -> None:
-    r = get_redis()
-    r.geoadd(GEO_KEY, (lng, lat, str(driver_id)))
+    pipe = get_redis().pipeline(transaction=True)
     # A short TTL companion key marks the driver "fresh"; if their app dies
     # without a clean disconnect event, they silently age out of matching
-    # instead of being offered rides forever.
-    r.setex(f"driver:heartbeat:{driver_id}", Config.DRIVER_LOCATION_TTL_SECONDS, "1")
+    # instead of being offered rides forever. Written before GEOADD (and in
+    # one MULTI) so the stale-member sweep never sees a member without it.
+    pipe.setex(_heartbeat_key(driver_id), Config.DRIVER_LOCATION_TTL_SECONDS, "1")
+    pipe.geoadd(GEO_KEY, (lng, lat, str(driver_id)))
+    pipe.execute()
+
+
+def refresh_driver_heartbeat(driver_id: int, lat: float, lng: float) -> bool:
+    """Returns True if the driver was in the pool and has been refreshed,
+    False if they are not in the pool (offline, on a trip, or already swept
+    as stale). Never adds a driver to the pool."""
+    result = get_redis().eval(
+        _REFRESH_IF_MEMBER_LUA, 2, GEO_KEY, _heartbeat_key(driver_id),
+        str(driver_id), lng, lat, Config.DRIVER_LOCATION_TTL_SECONDS,
+    )
+    return result == 1
 
 
 def remove_driver_location(driver_id: int) -> None:
+    pipe = get_redis().pipeline(transaction=True)
+    pipe.zrem(GEO_KEY, str(driver_id))
+    pipe.delete(_heartbeat_key(driver_id))
+    pipe.execute()
+
+
+def remove_if_stale(driver_id) -> bool:
+    return get_redis().eval(_REMOVE_IF_STALE_LUA, 2, GEO_KEY, _heartbeat_key(driver_id), str(driver_id)) == 1
+
+
+def sweep_stale_drivers() -> int:
+    """Redis GEO has no per-member TTL: when a driver's heartbeat key
+    expires, their drivers:geo member stays behind. Remove those members so
+    they stop occupying the index. Returns the number removed."""
     r = get_redis()
-    r.zrem(GEO_KEY, str(driver_id))
-    r.delete(f"driver:heartbeat:{driver_id}")
-
-
-def _is_fresh(driver_id: int) -> bool:
-    return get_redis().exists(f"driver:heartbeat:{driver_id}") == 1
+    members = r.zrange(GEO_KEY, 0, -1)
+    if not members:
+        return 0
+    pipe = r.pipeline(transaction=False)
+    for member in members:
+        pipe.exists(_heartbeat_key(member))
+    removed = 0
+    for member, fresh in zip(members, pipe.execute()):
+        if not fresh and remove_if_stale(member):
+            removed += 1
+    return removed
 
 
 def _candidates_from_redis(lat, lng, exclude_ids, count):
+    """Nearest fresh, non-excluded drivers, closest first.
+
+    GEOSEARCH knows nothing about heartbeats, so stale (and excluded)
+    members come back from it too. If the search were capped at `count`
+    before filtering, ten stale drivers next to the pickup would use up
+    every slot and hide a live driver further away. So freshness is checked
+    for each returned member (one pipelined round trip), stale members are
+    removed from the index as they are found, and the search is widened until
+    `count` usable drivers are found or the radius has nothing more."""
     r = get_redis()
+    search_count = count + len(exclude_ids)
     try:
-        raw = r.geosearch(
-            name=GEO_KEY,
-            longitude=lng,
-            latitude=lat,
-            radius=Config.DRIVER_SEARCH_RADIUS_KM,
-            unit="km",
-            sort="ASC",
-            count=count + len(exclude_ids),
-            withdist=True,
-        )
+        while True:
+            raw = r.geosearch(
+                name=GEO_KEY,
+                longitude=lng,
+                latitude=lat,
+                radius=Config.DRIVER_SEARCH_RADIUS_KM,
+                unit="km",
+                sort="ASC",
+                count=search_count,
+                withdist=True,
+            )
+            members = [(int(member), dist_km) for member, dist_km in raw if int(member) not in exclude_ids]
+            pipe = r.pipeline(transaction=False)
+            for driver_id, _ in members:
+                pipe.exists(_heartbeat_key(driver_id))
+            fresh_flags = pipe.execute() if members else []
+
+            out = []
+            for (driver_id, dist_km), fresh in zip(members, fresh_flags):
+                if fresh:
+                    out.append((driver_id, dist_km))
+                else:
+                    remove_if_stale(driver_id)
+            if len(out) >= count or len(raw) < search_count:
+                return out[:count]
+            search_count *= 2
     except Exception as e:  # noqa: BLE001 - redis down/unreachable
         logger.warning("Redis geosearch failed (%s); will fall back to SQL", e)
         return None
-
-    out = []
-    for member, dist_km in raw:
-        driver_id = int(member)
-        if driver_id in exclude_ids:
-            continue
-        if not _is_fresh(driver_id):
-            continue
-        out.append((driver_id, dist_km))
-        if len(out) >= count:
-            break
-    return out
 
 
 def _candidates_from_sql(lat, lng, exclude_ids, count):

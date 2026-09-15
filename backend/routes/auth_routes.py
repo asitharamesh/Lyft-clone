@@ -87,13 +87,22 @@ def login():
 
     if not email or not password:
         return _error("Email and password are required")
+    # `type` becomes the token's role claim, so it must never be free text.
+    if user_type not in ("rider", "driver", "admin"):
+        return _error("type must be 'rider', 'driver' or 'admin'")
 
-    table = "drivers" if user_type == "driver" else "users"
-    cols = "id, name, email, password, earnings" if user_type == "driver" else "id, name, email, password"
+    if user_type == "driver":
+        query = "SELECT id, name, email, password, earnings FROM drivers WHERE email = %s"
+    elif user_type == "admin":
+        # Admin is a flag on an existing users row, set only via set_admin.py
+        # (never from a request payload) and re-checked on every admin call.
+        query = "SELECT id, name, email, password FROM users WHERE email = %s AND is_admin = TRUE"
+    else:
+        query = "SELECT id, name, email, password FROM users WHERE email = %s"
 
     with get_db_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(f"SELECT {cols} FROM {table} WHERE email = %s", (email,))
+            cur.execute(query, (email,))
             row = cur.fetchone()
 
     # Same generic error whether the email doesn't exist or the password is

@@ -53,6 +53,13 @@ def seed_data():
                     (f"User {i}", f"user{i}@test.com", hashed, 12.9716, 77.5946),
                 )
 
+            print("Seeding demo admin...")
+            cur.execute(
+                "INSERT INTO users (name, email, password, latitude, longitude, is_admin) "
+                "VALUES (%s, %s, %s, %s, %s, TRUE)",
+                ("Admin", "admin@test.com", hashed, 12.9716, 77.5946),
+            )
+
             print("Seeding demo drivers...")
             for name, email, lat, lng, rating in DEMO_DRIVERS:
                 cur.execute(

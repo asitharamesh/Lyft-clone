@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Lyft Admin — Operations</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!--
+      Admin operations dashboard. This page is NOT the security boundary:
+      every request carries the admin's JWT and /api/admin/* re-checks the
+      token role and users.is_admin on the server. All values are rendered
+      as text nodes; no string is ever parsed as HTML.
+    -->
+    <style>
+        :root { --brand: #800020; --ok: #198754; --warn: #b8860b; --bad: #dc3545; --muted: #6c757d; --line: #e5e7eb; }
+        * { box-sizing: border-box; }
+        body { margin: 0; font-family: 'Segoe UI', sans-serif; background: #f4f6f8; color: #222; }
+        header { background: white; border-bottom: 1px solid var(--line); padding: 14px 24px; display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; position: sticky; top: 0; z-index: 10; }
+        header h1 { margin: 0; font-size: 20px; color: var(--brand); font-weight: 800; }
+        .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; font-size: 13px; color: var(--muted); }
+        button { background: var(--brand); color: white; border: none; border-radius: 8px; padding: 8px 14px; font-weight: 600; cursor: pointer; }
+        button.secondary { background: #444; }
+        main { padding: 20px 24px 40px; max-width: 1400px; margin: 0 auto; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+        .card { background: white; border-radius: 14px; box-shadow: 0 4px 14px rgba(0,0,0,0.06); padding: 16px 18px; min-width: 0; }
+        .card.wide { grid-column: 1 / -1; }
+        .card h2 { margin: 0 0 12px; font-size: 15px; color: var(--brand); display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+        .card h2 small { color: var(--muted); font-weight: 500; font-size: 12px; }
+        .stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 10px; }
+        .stat { background: #f8f9fa; border-radius: 10px; padding: 8px 10px; }
+        .stat .label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .03em; }
+        .stat .value { font-size: 20px; font-weight: 700; margin-top: 2px; font-variant-numeric: tabular-nums; }
+        .stat.bad .value { color: var(--bad); }
+        .stat.warn .value { color: var(--warn); }
+        .stat.ok .value { color: var(--ok); }
+        .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+        .dot.up { background: var(--ok); } .dot.down { background: var(--bad); }
+        .table-wrap { overflow-x: auto; margin-top: 10px; }
+        table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+        th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+        th { color: var(--muted); font-weight: 600; font-size: 11.5px; }
+        td.num { text-align: right; font-variant-numeric: tabular-nums; }
+        .empty { color: var(--muted); font-size: 12.5px; padding: 6px 0; }
+        .error { color: var(--bad); font-size: 13px; }
+        .notice { background: #fff3cd; color: #664d03; border-radius: 8px; padding: 8px 10px; font-size: 12.5px; margin-bottom: 10px; }
+        .bars { display: grid; gap: 6px; margin-top: 10px; }
+        .bar { display: grid; grid-template-columns: 90px 1fr 44px; gap: 8px; align-items: center; font-size: 12px; }
+        .bar .track { background: #eef0f2; border-radius: 6px; height: 12px; overflow: hidden; }
+        .bar .fill { background: var(--brand); height: 100%; }
+        .bar .count { text-align: right; font-variant-numeric: tabular-nums; }
+        .subhead { font-size: 12px; font-weight: 700; color: #444; margin: 14px 0 0; }
+        #banner { margin-bottom: 14px; }
+
+        /* Login screen — matches the rider/driver login page's red theme */
+        #login:not([hidden]) {
+            position: fixed; inset: 0; z-index: 100;
+            display: flex; justify-content: center; align-items: center;
+            background-color: #330011;
+            background-image: radial-gradient(circle at 50% 50%, #800020 0%, #1a0005 100%);
+            font-family: 'Segoe UI', sans-serif;
+        }
+        #login .login-card {
+            background: rgba(255,255,255,0.1);
+            padding: 40px; width: 340px; border-radius: 24px;
+            backdrop-filter: blur(20px);
+            border: 1px solid rgba(255,255,255,0.15);
+            text-align: center; color: white;
+            box-shadow: 0 20px 50px rgba(0,0,0,0.5);
+        }
+        #login h1 { margin: 0 0 8px 0; font-size: 36px; font-weight: 800; letter-spacing: -1px; }
+        #login p.subtitle { color: #ffccd5; margin: 0 0 25px; font-size: 13px; font-weight: 500; }
+        #login input { width: 100%; padding: 14px; margin-bottom: 12px; background: rgba(255,255,255,0.9); border: none; color: #333; border-radius: 14px; box-sizing: border-box; font-size: 15px; outline: none; }
+        #login button { width: 100%; padding: 14px; background: linear-gradient(45deg, #ff00bf, #800020); color: white; font-weight: bold; border: none; border-radius: 14px; cursor: pointer; font-size: 15px; margin-top: 6px; box-shadow: 0 5px 15px rgba(255, 0, 191, 0.3); }
+        #login .error { color: #ff6b6b; font-size: 13px; margin-top: 15px; min-height: 18px; font-weight: bold; }
+        #login .back-link { display: inline-block; margin-top: 22px; font-size: 12px; color: #ffccd5; text-decoration: none; opacity: 0.8; }
+        #login .back-link:hover { opacity: 1; }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Lyft Admin · Operations</h1>
+        <div class="controls" id="controls" hidden>
+            <span id="last-updated">Not loaded yet</span>
+            <label><input type="checkbox" id="auto-refresh" checked> Auto-refresh (10s)</label>
+            <button onclick="refresh()">Refresh</button>
+            <button class="secondary" onclick="logout()">Logout</button>
+        </div>
+    </header>
+
+    <div id="login" hidden>
+        <div class="login-card">
+            <h1>lyft</h1>
+            <p class="subtitle">Admin operations sign in</p>
+            <input type="email" id="email" placeholder="Admin email" autocomplete="username">
+            <input type="password" id="password" placeholder="Password" autocomplete="current-password">
+            <button onclick="login()">Sign in</button>
+            <p id="login-msg" class="error"></p>
+            <a href="login.html" class="back-link">← Back to rider / driver login</a>
+        </div>
+    </div>
+
+    <main id="dashboard" hidden>
+        <div id="banner"></div>
+        <div class="grid" id="cards"></div>
+    </main>
+
+    <script>
+        const backendBaseUrl = (window.__BACKEND_URL__ || 'http://127.0.0.1:5001').replace(/\/$/, '');
+        const REFRESH_MS = 10000;
+        let token = sessionStorage.getItem('admin_token');
+        let timer = null;
+
+        // --- tiny DOM helpers (text only, never HTML) ---
+        function el(tag, className, ...children) {
+            const node = document.createElement(tag);
+            if (className) node.className = className;
+            for (const child of children) {
+                if (child === null || child === undefined) continue;
+                node.append(child instanceof Node ? child : String(child));
+            }
+            return node;
+        }
+        function fmt(value) {
+            if (value === null || value === undefined || value === '') return '—';
+            if (typeof value === 'boolean') return value ? 'yes' : 'no';
+            if (typeof value === 'number') return Number.isInteger(value) ? value.toLocaleString() : value.toFixed(2);
+            if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(value)) return new Date(value).toLocaleString();
+            return String(value);
+        }
+        function stat(label, value, tone) {
+            return el('div', `stat ${tone || ''}`, el('div', 'label', label), el('div', 'value', fmt(value)));
+        }
+        function stats(...items) { return el('div', 'stats', ...items); }
+        function card(title, subtitle, ...children) {
+            const heading = el('h2', null, title, subtitle ? el('small', null, subtitle) : null);
+            return el('section', 'card', heading, ...children);
+        }
+        function wideCard(title, subtitle, ...children) {
+            const c = card(title, subtitle, ...children);
+            c.classList.add('wide');
+            return c;
+        }
+        function table(columns, rows, emptyText) {
+            if (!rows || rows.length === 0) return el('div', 'empty', emptyText || 'Nothing to show.');
+            const head = el('tr', null, ...columns.map(([, label]) => el('th', null, label)));
+            const body = rows.map(row => el('tr', null, ...columns.map(([key, , opts]) => {
+                const value = typeof key === 'function' ? key(row) : row[key];
+                return el('td', opts === 'num' ? 'num' : null, fmt(value));
+            })));
+            return el('div', 'table-wrap', el('table', null, el('thead', null, head), el('tbody', null, ...body)));
+        }
+        function bars(counts) {
+            const entries = Object.entries(counts || {});
+            const max = Math.max(1, ...entries.map(([, v]) => v));
+            return el('div', 'bars', ...entries.map(([label, value]) => {
+                const fill = el('div', 'fill');
+                fill.style.width = `${(value / max) * 100}%`;
+                return el('div', 'bar', el('span', null, label), el('div', 'track', fill), el('span', 'count', fmt(value)));
+            }));
+        }
+        function upDown(label, state) {
+            return el('div', 'stat', el('div', 'label', label),
+                el('div', 'value', el('span', `dot ${state === 'up' ? 'up' : 'down'}`), state || 'unknown'));
+        }
+        function sectionError(section) {
+            return section && section.error ? el('p', 'error', section.error) : null;
+        }
+        function duration(seconds) {
+            const s = Math.max(0, seconds | 0);
+            const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+            return d ? `${d}d ${h}h ${m}m` : h ? `${h}h ${m}m` : `${m}m ${s % 60}s`;
+        }
+
+        // --- rendering ---
+        function render(data) {
+            const cards = [];
+            const sys = data.system || {};
+            cards.push(card('System health', sys.scope_note,
+                sectionError(sys),
+                stats(
+                    upDown('Backend', sys.backend), upDown('PostgreSQL', sys.postgres), upDown('Redis', sys.redis),
+                    stat('Uptime', sys.uptime_seconds !== undefined ? duration(sys.uptime_seconds) : null),
+                    stat('Sockets', sys.sockets && sys.sockets.total_sockets),
+                    stat('Warnings logged', sys.log_counts && sys.log_counts.warning, sys.log_counts && sys.log_counts.warning ? 'warn' : ''),
+                    stat('Errors logged', sys.log_counts && sys.log_counts.error, sys.log_counts && sys.log_counts.error ? 'bad' : ''),
+                    stat('Simulator', sys.ride_simulator),
+                    stat('Environment', sys.environment),
+                    stat('Load-test mode', sys.load_test_mode, sys.load_test_mode ? 'warn' : ''),
+                ),
+                sys.sockets ? table([['role', 'Role'], ['sockets', 'Sockets', 'num'], ['users', 'Unique users', 'num']],
+                    Object.keys(sys.sockets.sockets_by_role || {}).map(role => ({
+                        role, sockets: sys.sockets.sockets_by_role[role], users: (sys.sockets.unique_users_by_role || {})[role],
+                    })), 'No sockets connected to this process.') : null,
+            ));
+
+            const users = data.users || {};
+            cards.push(card('Users', null, sectionError(users), stats(
+                stat('Rider accounts', users.riders), stat('Admins', users.admins), stat('Drivers', users.drivers),
+                stat('Drivers flagged available', users.drivers_marked_available),
+                stat('Riders connected', users.connected_riders), stat('Drivers connected', users.connected_drivers),
+            )));
+
+            const m = data.matching || {};
+            cards.push(card('Driver matching', m.config ? `radius ${m.config.search_radius_km} km · top ${m.config.candidates} · TTL ${m.config.heartbeat_ttl_seconds}s` : null,
+                sectionError(m),
+                stats(
+                    stat('In GEO index', m.in_geo_index), stat('Fresh', m.fresh, 'ok'), stat('Stale', m.stale, m.stale ? 'warn' : ''),
+                    stat('Eligible now', m.eligible, 'ok'), stat('Holding offer', m.drivers_holding_offer), stat('On trip', m.drivers_on_trip),
+                    stat('On trip but in index', m.on_trip_but_in_index, m.on_trip_but_in_index ? 'bad' : ''),
+                    stat('Offers made', m.match_offered_total), stat('No driver available', m.no_driver_available_total, m.no_driver_available_total ? 'warn' : ''),
+                    stat('Offers expired', m.offer_expired_total), stat('Requests expired', m.request_expired_total),
+                ),
+            ));
+
+            const rides = data.rides || {};
+            cards.push(card('Rides', rides.legacy_rows_without_lifecycle ? `${rides.legacy_rows_without_lifecycle} legacy row(s) excluded` : null,
+                sectionError(rides),
+                bars(rides.by_status),
+                rides.active_by_progress && Object.keys(rides.active_by_progress).length ? el('p', 'subhead', 'Active rides by trip step') : null,
+                rides.active_by_progress && Object.keys(rides.active_by_progress).length ? bars(rides.active_by_progress) : null,
+            ));
+
+            const offers = data.offers || {};
+            cards.push(card('Offers', m.config ? `timeout ${m.config.offer_timeout_seconds}s` : null,
+                sectionError(offers),
+                offers.by_status ? bars(offers.by_status) : null,
+                stats(stat('Overdue pending (not yet swept)', offers.overdue_pending, offers.overdue_pending ? 'warn' : '')),
+            ));
+
+            const pay = data.payments || {};
+            cards.push(card('Payment confirmations', null,
+                pay.notice ? el('div', 'notice', pay.notice) : null,
+                sectionError(pay),
+                stats(
+                    stat('Confirmations', pay.confirmations), stat('Total confirmed (₹)', pay.total_confirmed_amount),
+                    stat('Awaiting confirmation', pay.completed_awaiting_confirmation),
+                    stat('Refused: duplicate', pay.refused_duplicate_confirmations, pay.refused_duplicate_confirmations ? 'warn' : ''),
+                    stat('Refused: amount mismatch', pay.refused_amount_mismatch, pay.refused_amount_mismatch ? 'bad' : ''),
+                    stat('Refused: not eligible', pay.refused_not_eligible, pay.refused_not_eligible ? 'warn' : ''),
+                    stat('Paid ≠ fare', pay.paid_amount_differs_from_fare, pay.paid_amount_differs_from_fare ? 'bad' : ''),
+                ),
+            ));
+
+            const redis = data.redis || {};
+            cards.push(card('Redis', redis.redis_version ? `v${redis.redis_version} · ${redis.used_memory_human}` : null,
+                sectionError(redis),
+                stats(
+                    stat('Keys in DB', redis.db_keys), stat('drivers:geo members', redis.drivers_geo_members),
+                    stat('Heartbeat keys', redis.driver_heartbeat_keys), stat('Active-ride cache', redis.driver_active_ride_cache_keys),
+                    stat('Location throttle keys', redis.driver_location_throttle_keys), stat('Stats keys', redis.stats_keys),
+                    stat('Legacy ride_request keys', redis.legacy_ride_request_keys, redis.legacy_ride_request_keys ? 'warn' : ''),
+                ),
+            ));
+
+            const pg = data.postgres || {};
+            cards.push(card('PostgreSQL', pg.server_version ? `v${pg.server_version} · pool ${pg.pool.min}–${pg.pool.max}` : null,
+                sectionError(pg),
+                pg.table_rows ? table([['table', 'Table'], ['rows', 'Rows', 'num']],
+                    Object.entries(pg.table_rows).map(([t, rows]) => ({ table: t, rows }))) : null,
+            ));
+
+            cards.push(wideCard('Drivers in the matching index', 'positions rounded to 4 decimals',
+                table([
+                    ['driver_id', 'Driver', 'num'], ['name', 'Name'], ['lat', 'Lat', 'num'], ['lng', 'Lng', 'num'],
+                    ['heartbeat_ttl_seconds', 'Heartbeat TTL (s)', 'num'], ['fresh', 'Fresh'], ['offered', 'Holding offer'],
+                    ['on_trip', 'On trip'], ['eligible', 'Eligible'],
+                ], m.drivers, 'No drivers in the index.'),
+            ));
+
+            cards.push(wideCard('Pending offers', null,
+                table([
+                    ['offer_id', 'Offer', 'num'], ['request', 'Ride'], ['driver_id', 'Driver', 'num'],
+                    ['age_seconds', 'Age (s)', 'num'], ['expires_in_seconds', 'Expires in (s)', 'num'],
+                ], offers.pending, 'No pending offers.'),
+            ));
+
+            const issues = rides.issues || {};
+            cards.push(wideCard('Rides needing attention', null,
+                el('p', 'subhead', 'Requested, no offer outstanding for over 60s'),
+                table([['request', 'Ride'], ['updated_at', 'Since']], issues.requested_without_offer_over_60s, 'None.'),
+                el('p', 'subhead', 'Active with no update for 30+ minutes'),
+                table([['request', 'Ride'], ['status', 'Status'], ['progress', 'Step'], ['driver_id', 'Driver', 'num'], ['updated_at', 'Last update']], issues.active_without_update, 'None.'),
+                el('p', 'subhead', 'Completed, payment not confirmed for 30+ minutes'),
+                table([['request', 'Ride'], ['driver_id', 'Driver', 'num'], ['fare', 'Fare', 'num'], ['completed_at', 'Completed']], issues.completed_unpaid, 'None.'),
+                el('p', 'subhead', 'Inconsistent state'),
+                table([['request', 'Ride'], ['status', 'Status'], ['progress', 'Step'], ['driver_id', 'Driver', 'num'], ['paid_at', 'Paid at']], issues.inconsistent, 'None.'),
+            ));
+
+            cards.push(wideCard('Recent ride transitions', null,
+                table([
+                    ['request', 'Ride'], ['status', 'Status'], ['progress', 'Step'], ['driver_id', 'Driver', 'num'],
+                    ['fare', 'Fare', 'num'], ['cancel_reason', 'Cancel reason'], ['paid', 'Paid'], ['updated_at', 'Updated'],
+                ], rides.recent, 'No rides yet.'),
+            ));
+
+            cards.push(wideCard('Recent offers', null,
+                table([
+                    ['offer_id', 'Offer', 'num'], ['request', 'Ride'], ['driver_id', 'Driver', 'num'], ['status', 'Status'],
+                    ['created_at', 'Created'], ['responded_at', 'Responded'],
+                ], offers.recent, 'No offers yet.'),
+            ));
+
+            cards.push(wideCard('Recent matching attempts', 'newest first',
+                table([
+                    [r => r.at ? new Date(r.at * 1000).toISOString() : null, 'At'], ['request', 'Ride'], ['outcome', 'Outcome'],
+                    ['driver_id', 'Driver', 'num'], ['excluded', 'Excluded drivers', 'num'],
+                ], m.recent_matches, 'No matching attempts recorded.'),
+            ));
+
+            cards.push(wideCard('Recent payment confirmations', null,
+                table([['request', 'Ride'], ['driver_id', 'Driver', 'num'], ['amount', 'Amount (₹)', 'num'], ['paid_at', 'Confirmed']],
+                    pay.recent_confirmations, 'No confirmations yet.'),
+            ));
+
+            document.getElementById('cards').replaceChildren(...cards);
+            document.getElementById('banner').replaceChildren();
+            document.getElementById('last-updated').textContent = `Updated ${new Date(data.generated_at).toLocaleTimeString()}`;
+        }
+
+        function showBanner(message) {
+            document.getElementById('banner').replaceChildren(el('div', 'card error', message));
+        }
+
+        // --- data / auth ---
+        async function refresh() {
+            if (!token) return showLogin();
+            try {
+                const res = await fetch(`${backendBaseUrl}/api/admin/overview`, { headers: { Authorization: `Bearer ${token}` } });
+                if (res.status === 401 || res.status === 403) {
+                    const message = res.status === 403 ? 'This account is not an administrator.' : 'Your session has expired. Please sign in again.';
+                    logout(message);
+                    return;
+                }
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                render(await res.json());
+            } catch (e) {
+                showBanner(`Could not load the dashboard: ${e.message}. Is the backend running at ${backendBaseUrl}?`);
+            }
+        }
+
+        function schedule() {
+            clearInterval(timer);
+            timer = setInterval(() => {
+                if (document.getElementById('auto-refresh').checked && !document.hidden) refresh();
+            }, REFRESH_MS);
+        }
+
+        function showLogin(message) {
+            clearInterval(timer);
+            document.getElementById('dashboard').hidden = true;
+            document.getElementById('controls').hidden = true;
+            document.getElementById('login').hidden = false;
+            document.getElementById('login-msg').textContent = message || '';
+        }
+
+        function showDashboard() {
+            document.getElementById('login').hidden = true;
+            document.getElementById('dashboard').hidden = false;
+            document.getElementById('controls').hidden = false;
+            refresh();
+            schedule();
+        }
+
+        async function login() {
+            const msg = document.getElementById('login-msg');
+            msg.textContent = '';
+            try {
+                const res = await fetch(`${backendBaseUrl}/api/login`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ type: 'admin', email: document.getElementById('email').value, password: document.getElementById('password').value }),
+                });
+                const data = await res.json();
+                if (!data.success) { msg.textContent = data.message || 'Sign in failed.'; return; }
+                token = data.token;
+                sessionStorage.setItem('admin_token', token);
+                document.getElementById('password').value = '';
+                showDashboard();
+            } catch (e) {
+                msg.textContent = `Could not reach the backend at ${backendBaseUrl}.`;
+            }
+        }
+
+        function logout(message) {
+            token = null;
+            sessionStorage.removeItem('admin_token');
+            showLogin(typeof message === 'string' ? message : '');
+        }
+
+        if (token) showDashboard(); else showLogin();
+    </script>
+</body>
+</html>
