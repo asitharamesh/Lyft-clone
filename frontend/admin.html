@@ -50,6 +50,30 @@
         .subhead { font-size: 12px; font-weight: 700; color: #444; margin: 14px 0 0; }
         #banner { margin-bottom: 14px; }
 
+        /* Fare highlight */
+        td.fare, span.fare-inline { color: var(--brand); font-weight: 800; }
+        .hero { background: linear-gradient(135deg, var(--brand), #4d0013); color: white; }
+        .hero h2 { color: white; }
+        .hero h2 small { color: #ffccd5; }
+        .hero-main { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+        .hero-main .amount { font-size: 40px; font-weight: 800; font-variant-numeric: tabular-nums; }
+        .hero-main .amount-label { font-size: 13px; color: #ffccd5; }
+        .hero .stats .stat { background: rgba(255,255,255,0.12); }
+        .hero .stats .label { color: #ffd7e0; }
+        .hero .stats .value { color: white; }
+
+        /* Donut chart */
+        .donut-wrap { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; margin-top: 8px; }
+        .donut-ring { position: relative; width: 130px; height: 130px; border-radius: 50%; flex-shrink: 0; }
+        .donut-center { position: absolute; inset: 16px; background: white; border-radius: 50%; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+        .donut-total { font-size: 20px; font-weight: 800; }
+        .donut-label { font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .03em; }
+        .legend { display: grid; gap: 6px; font-size: 12.5px; }
+        .legend-item { display: flex; align-items: center; gap: 6px; }
+        .swatch { width: 10px; height: 10px; border-radius: 3px; flex-shrink: 0; }
+        .legend-item .count { margin-left: auto; font-variant-numeric: tabular-nums; font-weight: 600; }
+        .all-clear { color: var(--ok); font-size: 13px; font-weight: 600; }
+
         /* Login screen — matches the rider/driver login page's red theme */
         #login:not([hidden]) {
             position: fixed; inset: 0; z-index: 100;
@@ -142,9 +166,10 @@
         function table(columns, rows, emptyText) {
             if (!rows || rows.length === 0) return el('div', 'empty', emptyText || 'Nothing to show.');
             const head = el('tr', null, ...columns.map(([, label]) => el('th', null, label)));
+            const cellClass = opts => opts === 'num' ? 'num' : opts === 'fare' ? 'num fare' : null;
             const body = rows.map(row => el('tr', null, ...columns.map(([key, , opts]) => {
                 const value = typeof key === 'function' ? key(row) : row[key];
-                return el('td', opts === 'num' ? 'num' : null, fmt(value));
+                return el('td', cellClass(opts), fmt(value));
             })));
             return el('div', 'table-wrap', el('table', null, el('thead', null, head), el('tbody', null, ...body)));
         }
@@ -156,6 +181,32 @@
                 fill.style.width = `${(value / max) * 100}%`;
                 return el('div', 'bar', el('span', null, label), el('div', 'track', fill), el('span', 'count', fmt(value)));
             }));
+        }
+        const STATUS_COLORS = { requested: '#6c757d', accepted: '#800020', in_progress: '#b8860b', completed: '#198754', cancelled: '#dc3545' };
+        function donutChart(counts, label) {
+            const entries = Object.entries(counts || {}).filter(([, v]) => v > 0);
+            const total = entries.reduce((s, [, v]) => s + v, 0);
+            const ring = el('div', 'donut-ring');
+            if (total === 0) {
+                ring.style.background = '#eef0f2';
+            } else {
+                let acc = 0;
+                const stops = entries.map(([status, v]) => {
+                    const start = acc / total * 360;
+                    acc += v;
+                    const end = acc / total * 360;
+                    return `${STATUS_COLORS[status] || '#999'} ${start}deg ${end}deg`;
+                });
+                ring.style.background = `conic-gradient(${stops.join(', ')})`;
+            }
+            ring.append(el('div', 'donut-center', el('div', 'donut-total', fmt(total)), el('div', 'donut-label', label || 'total')));
+            const legend = el('div', 'legend', ...entries.map(([status, v]) => {
+                const swatch = el('span', 'swatch');
+                swatch.style.background = STATUS_COLORS[status] || '#999';
+                return el('div', 'legend-item', swatch, status.replace('_', ' '), el('span', 'count', fmt(v)));
+            }));
+            if (entries.length === 0) return el('div', 'empty', 'No data yet.');
+            return el('div', 'donut-wrap', ring, legend);
         }
         function upDown(label, state) {
             return el('div', 'stat', el('div', 'label', label),
@@ -174,140 +225,86 @@
         function render(data) {
             const cards = [];
             const sys = data.system || {};
-            cards.push(card('System health', sys.scope_note,
+            const rides = data.rides || {};
+            const users = data.users || {};
+            const m = data.matching || {};
+            const offers = data.offers || {};
+            const pay = data.payments || {};
+
+            // --- Fare / revenue highlight ---
+            const avgFare = pay.confirmations ? pay.total_confirmed_amount / pay.confirmations : null;
+            const heroCard = card('Ride fare collected', pay.notice, sectionError(pay));
+            heroCard.classList.add('hero');
+            heroCard.append(
+                el('div', 'hero-main', el('span', 'amount', `₹${fmt(pay.total_confirmed_amount)}`), el('span', 'amount-label', `across ${fmt(pay.confirmations)} confirmed payments`)),
+                stats(
+                    stat('Average fare (₹)', avgFare !== null ? Number(avgFare.toFixed(2)) : null),
+                    stat('Awaiting confirmation', pay.completed_awaiting_confirmation),
+                    stat('Amount mismatches', pay.paid_amount_differs_from_fare, pay.paid_amount_differs_from_fare ? 'bad' : ''),
+                ),
+            );
+            cards.push(heroCard);
+
+            // --- System status (compact) ---
+            const allUp = sys.backend === 'up' && sys.postgres === 'up' && sys.redis === 'up';
+            const logIssues = (sys.log_counts && (sys.log_counts.warning || 0) + (sys.log_counts.error || 0)) || 0;
+            cards.push(card('System status', allUp ? 'All systems operational' : 'Degraded — see indicators',
                 sectionError(sys),
                 stats(
                     upDown('Backend', sys.backend), upDown('PostgreSQL', sys.postgres), upDown('Redis', sys.redis),
                     stat('Uptime', sys.uptime_seconds !== undefined ? duration(sys.uptime_seconds) : null),
-                    stat('Sockets', sys.sockets && sys.sockets.total_sockets),
-                    stat('Warnings logged', sys.log_counts && sys.log_counts.warning, sys.log_counts && sys.log_counts.warning ? 'warn' : ''),
-                    stat('Errors logged', sys.log_counts && sys.log_counts.error, sys.log_counts && sys.log_counts.error ? 'bad' : ''),
-                    stat('Simulator', sys.ride_simulator),
-                    stat('Environment', sys.environment),
-                    stat('Load-test mode', sys.load_test_mode, sys.load_test_mode ? 'warn' : ''),
+                    stat('Connected users', sys.sockets && sys.sockets.total_sockets),
+                    stat('Log issues', logIssues, logIssues ? 'bad' : ''),
                 ),
-                sys.sockets ? table([['role', 'Role'], ['sockets', 'Sockets', 'num'], ['users', 'Unique users', 'num']],
-                    Object.keys(sys.sockets.sockets_by_role || {}).map(role => ({
-                        role, sockets: sys.sockets.sockets_by_role[role], users: (sys.sockets.unique_users_by_role || {})[role],
-                    })), 'No sockets connected to this process.') : null,
             ));
 
-            const users = data.users || {};
-            cards.push(card('Users', null, sectionError(users), stats(
-                stat('Rider accounts', users.riders), stat('Admins', users.admins), stat('Drivers', users.drivers),
-                stat('Drivers flagged available', users.drivers_marked_available),
-                stat('Riders connected', users.connected_riders), stat('Drivers connected', users.connected_drivers),
+            // --- Rides overview (donut chart) ---
+            cards.push(card('Rides overview', rides.legacy_rows_without_lifecycle ? `${rides.legacy_rows_without_lifecycle} legacy row(s) excluded` : null,
+                sectionError(rides),
+                donutChart(rides.by_status, 'rides'),
+            ));
+
+            // --- Users & drivers (compact) ---
+            cards.push(card('Users & drivers', null, sectionError(users), stats(
+                stat('Riders', users.riders), stat('Drivers', users.drivers), stat('Available now', users.drivers_marked_available, 'ok'),
             )));
 
-            const m = data.matching || {};
-            cards.push(card('Driver matching', m.config ? `radius ${m.config.search_radius_km} km · top ${m.config.candidates} · TTL ${m.config.heartbeat_ttl_seconds}s` : null,
-                sectionError(m),
-                stats(
-                    stat('In GEO index', m.in_geo_index), stat('Fresh', m.fresh, 'ok'), stat('Stale', m.stale, m.stale ? 'warn' : ''),
-                    stat('Eligible now', m.eligible, 'ok'), stat('Holding offer', m.drivers_holding_offer), stat('On trip', m.drivers_on_trip),
-                    stat('On trip but in index', m.on_trip_but_in_index, m.on_trip_but_in_index ? 'bad' : ''),
-                    stat('Offers made', m.match_offered_total), stat('No driver available', m.no_driver_available_total, m.no_driver_available_total ? 'warn' : ''),
-                    stat('Offers expired', m.offer_expired_total), stat('Requests expired', m.request_expired_total),
-                ),
-            ));
+            // --- Live matching (compact) ---
+            cards.push(card('Live matching', null, sectionError(m), stats(
+                stat('Eligible now', m.eligible, 'ok'), stat('On trip', m.drivers_on_trip),
+                stat('Offers pending', m.drivers_holding_offer), stat('Overdue offers', offers.overdue_pending, offers.overdue_pending ? 'warn' : ''),
+                stat('No driver available', m.no_driver_available_total, m.no_driver_available_total ? 'warn' : ''),
+            )));
 
-            const rides = data.rides || {};
-            cards.push(card('Rides', rides.legacy_rows_without_lifecycle ? `${rides.legacy_rows_without_lifecycle} legacy row(s) excluded` : null,
-                sectionError(rides),
-                bars(rides.by_status),
-                rides.active_by_progress && Object.keys(rides.active_by_progress).length ? el('p', 'subhead', 'Active rides by trip step') : null,
-                rides.active_by_progress && Object.keys(rides.active_by_progress).length ? bars(rides.active_by_progress) : null,
-            ));
-
-            const offers = data.offers || {};
-            cards.push(card('Offers', m.config ? `timeout ${m.config.offer_timeout_seconds}s` : null,
-                sectionError(offers),
-                offers.by_status ? bars(offers.by_status) : null,
-                stats(stat('Overdue pending (not yet swept)', offers.overdue_pending, offers.overdue_pending ? 'warn' : '')),
-            ));
-
-            const pay = data.payments || {};
-            cards.push(card('Payment confirmations', null,
-                pay.notice ? el('div', 'notice', pay.notice) : null,
-                sectionError(pay),
-                stats(
-                    stat('Confirmations', pay.confirmations), stat('Total confirmed (₹)', pay.total_confirmed_amount),
-                    stat('Awaiting confirmation', pay.completed_awaiting_confirmation),
-                    stat('Refused: duplicate', pay.refused_duplicate_confirmations, pay.refused_duplicate_confirmations ? 'warn' : ''),
-                    stat('Refused: amount mismatch', pay.refused_amount_mismatch, pay.refused_amount_mismatch ? 'bad' : ''),
-                    stat('Refused: not eligible', pay.refused_not_eligible, pay.refused_not_eligible ? 'warn' : ''),
-                    stat('Paid ≠ fare', pay.paid_amount_differs_from_fare, pay.paid_amount_differs_from_fare ? 'bad' : ''),
-                ),
-            ));
-
-            const redis = data.redis || {};
-            cards.push(card('Redis', redis.redis_version ? `v${redis.redis_version} · ${redis.used_memory_human}` : null,
-                sectionError(redis),
-                stats(
-                    stat('Keys in DB', redis.db_keys), stat('drivers:geo members', redis.drivers_geo_members),
-                    stat('Heartbeat keys', redis.driver_heartbeat_keys), stat('Active-ride cache', redis.driver_active_ride_cache_keys),
-                    stat('Location throttle keys', redis.driver_location_throttle_keys), stat('Stats keys', redis.stats_keys),
-                    stat('Legacy ride_request keys', redis.legacy_ride_request_keys, redis.legacy_ride_request_keys ? 'warn' : ''),
-                ),
-            ));
-
-            const pg = data.postgres || {};
-            cards.push(card('PostgreSQL', pg.server_version ? `v${pg.server_version} · pool ${pg.pool.min}–${pg.pool.max}` : null,
-                sectionError(pg),
-                pg.table_rows ? table([['table', 'Table'], ['rows', 'Rows', 'num']],
-                    Object.entries(pg.table_rows).map(([t, rows]) => ({ table: t, rows }))) : null,
-            ));
-
-            cards.push(wideCard('Drivers in the matching index', 'positions rounded to 4 decimals',
-                table([
-                    ['driver_id', 'Driver', 'num'], ['name', 'Name'], ['lat', 'Lat', 'num'], ['lng', 'Lng', 'num'],
-                    ['heartbeat_ttl_seconds', 'Heartbeat TTL (s)', 'num'], ['fresh', 'Fresh'], ['offered', 'Holding offer'],
-                    ['on_trip', 'On trip'], ['eligible', 'Eligible'],
-                ], m.drivers, 'No drivers in the index.'),
-            ));
-
-            cards.push(wideCard('Pending offers', null,
-                table([
-                    ['offer_id', 'Offer', 'num'], ['request', 'Ride'], ['driver_id', 'Driver', 'num'],
-                    ['age_seconds', 'Age (s)', 'num'], ['expires_in_seconds', 'Expires in (s)', 'num'],
-                ], offers.pending, 'No pending offers.'),
-            ));
-
+            // --- Attention needed ---
             const issues = rides.issues || {};
-            cards.push(wideCard('Rides needing attention', null,
-                el('p', 'subhead', 'Requested, no offer outstanding for over 60s'),
-                table([['request', 'Ride'], ['updated_at', 'Since']], issues.requested_without_offer_over_60s, 'None.'),
-                el('p', 'subhead', 'Active with no update for 30+ minutes'),
-                table([['request', 'Ride'], ['status', 'Status'], ['progress', 'Step'], ['driver_id', 'Driver', 'num'], ['updated_at', 'Last update']], issues.active_without_update, 'None.'),
-                el('p', 'subhead', 'Completed, payment not confirmed for 30+ minutes'),
-                table([['request', 'Ride'], ['driver_id', 'Driver', 'num'], ['fare', 'Fare', 'num'], ['completed_at', 'Completed']], issues.completed_unpaid, 'None.'),
-                el('p', 'subhead', 'Inconsistent state'),
-                table([['request', 'Ride'], ['status', 'Status'], ['progress', 'Step'], ['driver_id', 'Driver', 'num'], ['paid_at', 'Paid at']], issues.inconsistent, 'None.'),
-            ));
+            const issueSections = [
+                ['Requested, no offer for 60s+', ['request', 'Ride'], ['updated_at', 'Since'], issues.requested_without_offer_over_60s],
+                ['Active, no update for 30+ min', ['request', 'Ride'], ['status', 'Status'], issues.active_without_update],
+                ['Completed, payment unconfirmed 30+ min', ['request', 'Ride'], ['fare', 'Fare', 'fare'], issues.completed_unpaid],
+                ['Inconsistent state', ['request', 'Ride'], ['status', 'Status'], issues.inconsistent],
+            ].filter(([, , , rows]) => rows && rows.length);
+            const attentionCard = wideCard('Attention needed', null, sectionError(rides));
+            if (issueSections.length === 0) {
+                attentionCard.append(el('p', 'all-clear', 'No rides currently need attention.'));
+            } else {
+                issueSections.forEach(([title, colA, colB, rows]) => {
+                    attentionCard.append(el('p', 'subhead', title), table([colA, colB], rows, 'None.'));
+                });
+            }
+            cards.push(attentionCard);
 
-            cards.push(wideCard('Recent ride transitions', null,
+            // --- Recent rides (fare highlighted) ---
+            cards.push(wideCard('Recent rides', null,
                 table([
-                    ['request', 'Ride'], ['status', 'Status'], ['progress', 'Step'], ['driver_id', 'Driver', 'num'],
-                    ['fare', 'Fare', 'num'], ['cancel_reason', 'Cancel reason'], ['paid', 'Paid'], ['updated_at', 'Updated'],
+                    ['request', 'Ride'], ['status', 'Status'], ['driver_id', 'Driver', 'num'],
+                    ['fare', 'Fare (₹)', 'fare'], ['paid', 'Paid'], ['updated_at', 'Updated'],
                 ], rides.recent, 'No rides yet.'),
             ));
 
-            cards.push(wideCard('Recent offers', null,
-                table([
-                    ['offer_id', 'Offer', 'num'], ['request', 'Ride'], ['driver_id', 'Driver', 'num'], ['status', 'Status'],
-                    ['created_at', 'Created'], ['responded_at', 'Responded'],
-                ], offers.recent, 'No offers yet.'),
-            ));
-
-            cards.push(wideCard('Recent matching attempts', 'newest first',
-                table([
-                    [r => r.at ? new Date(r.at * 1000).toISOString() : null, 'At'], ['request', 'Ride'], ['outcome', 'Outcome'],
-                    ['driver_id', 'Driver', 'num'], ['excluded', 'Excluded drivers', 'num'],
-                ], m.recent_matches, 'No matching attempts recorded.'),
-            ));
-
+            // --- Recent payment confirmations (amount highlighted) ---
             cards.push(wideCard('Recent payment confirmations', null,
-                table([['request', 'Ride'], ['driver_id', 'Driver', 'num'], ['amount', 'Amount (₹)', 'num'], ['paid_at', 'Confirmed']],
+                table([['request', 'Ride'], ['driver_id', 'Driver', 'num'], ['amount', 'Amount (₹)', 'fare'], ['paid_at', 'Confirmed']],
                     pay.recent_confirmations, 'No confirmations yet.'),
             ));
 
